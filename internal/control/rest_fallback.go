@@ -11,6 +11,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/getthelostcode/hysteria-agent/gen/agentpb"
@@ -84,31 +85,100 @@ func (c *Client) runRESTFallback(ctx context.Context, cause error) {
 		interval = 30 * time.Second
 	}
 
-	// 立刻发一次，别让运维等一个心跳周期。
-	c.sendRESTHeartbeat(ctx)
-	// 配置也立刻拉一次：面板可能刚好发布过新配置
-	c.pollRESTConfig(ctx)
-
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-
 	configEvery := time.Duration(c.cfg.Control.ConfigPollSeconds * float64(time.Second))
 	if configEvery <= 0 {
 		configEvery = 5 * time.Second
 	}
-	configTicker := time.NewTicker(configEvery)
-	defer configTicker.Stop()
 
-	for time.Now().Before(deadline) {
+	// 心跳与配置轮询**各跑各的 goroutine**。
+	//
+	// 踩过的坑：两件事共用一个 select 循环时，配置应用（校验→落盘→热重载→等就绪）一旦慢下来
+	// （hysteria 就绪检查重试，实测 30s+，节点上还可能一直失败），心跳会被一起饿死 ——
+	// 面板上的表现就是「最后心跳不更新」，看着像节点掉线，其实 agent 正忙着应用配置。
+	// 存活上报必须独立于业务动作：它是运维判断生死的唯一依据。
+	var wg sync.WaitGroup
+	run := func(fn func()) {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			fn()
+		}()
+	}
+
+	// 窗口一到就整体收工，回到「重试控制通道」的状态。
+	loopCtx, cancelLoops := context.WithDeadline(ctx, deadline)
+	defer cancelLoops()
+
+	run(func() { c.restHeartbeatLoop(loopCtx, deadline, interval) })
+	run(func() { c.restConfigLoop(loopCtx, deadline, configEvery) })
+
+	<-loopCtx.Done()
+
+	// 收尾最多等一小会儿：配置应用可能不认 ctx（等 hysteria 就绪的循环），
+	// 不能让它把「回控制通道重试」也一起拖住。
+	settled := make(chan struct{})
+	go func() { wg.Wait(); close(settled) }()
+
+	select {
+	case <-settled:
+	case <-time.After(2 * time.Second):
+		c.log.Warn("REST 兜底窗口到期，仍有配置动作未收尾；先回到控制通道重试")
+	}
+}
+
+// restHeartbeatLoop 独立心跳：只要进程活着、窗口没到，就按 interval 一直上报。
+func (c *Client) restHeartbeatLoop(ctx context.Context, deadline time.Time, interval time.Duration) {
+	c.sendRESTHeartbeat(ctx) // 立刻一次，别让运维等一个周期
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
+			if !time.Now().Before(deadline) {
+				return
+			}
 			c.sendRESTHeartbeat(ctx)
-		case <-configTicker.C:
-			c.pollRESTConfig(ctx)
 		}
 	}
+}
+
+// restConfigLoop 独立配置轮询：串行取配置（应用慢也只拖慢自己，不影响心跳）。
+func (c *Client) restConfigLoop(ctx context.Context, deadline time.Time, every time.Duration) {
+	apply := func() {
+		actx, cancel := context.WithTimeout(ctx, c.configApplyTimeout())
+		defer cancel()
+		c.pollRESTConfig(actx)
+	}
+
+	apply() // 进兜底先拉一次：面板可能刚好发布过新配置
+
+	ticker := time.NewTicker(every)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if !time.Now().Before(deadline) {
+				return
+			}
+			apply()
+		}
+	}
+}
+
+// configApplyTimeout 单次「取配置 + 应用」的总超时（应用可能包含等 hysteria 就绪的重试）。
+func (c *Client) configApplyTimeout() time.Duration {
+	if secs := c.cfg.Control.ConfigApplyTimeoutSeconds; secs > 0 {
+		return time.Duration(secs * float64(time.Second))
+	}
+
+	return 180 * time.Second
 }
 
 func (c *Client) sendRESTHeartbeat(ctx context.Context) {

@@ -66,6 +66,10 @@ type Control struct {
 
 	// ConfigPollSeconds：REST 兜底时轮询配置的间隔（默认 5s，与 Go 控制面的 poll.config_seconds 对齐）。
 	ConfigPollSeconds float64 `yaml:"config_poll_seconds"`
+
+	// ConfigApplyTimeoutSeconds：单次「取配置 + 应用」的总超时（默认 180s）。应用里包含等
+	// hysteria 就绪的重试，没有上限的话一次卡住会让轮询永久停在原地。
+	ConfigApplyTimeoutSeconds float64 `yaml:"config_apply_timeout_seconds"`
 }
 
 // Hysteria 被管理的 Hysteria2 服务端。
@@ -231,6 +235,7 @@ func Default() *Config {
 			TokenRefreshLeewaySeconds: 300,
 			RESTFallbackSeconds:       300,
 			ConfigPollSeconds:         5,
+			ConfigApplyTimeoutSeconds: 180,
 			Reconnect:                 Reconnect{InitialSeconds: 1, MaxSeconds: 300, Multiplier: 2, Jitter: 0.2},
 		},
 		CredentialsFile: DefaultCredsPath,
