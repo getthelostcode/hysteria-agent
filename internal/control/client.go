@@ -105,6 +105,8 @@ type Client struct {
 	lastSeen     time.Time
 	// restConfigVersion：兜底下最近一次取到的配置版本（面板按 int 版本号比较）
 	restConfigVersion int
+	// driftWarned：已经提示过的漂移（避免心跳周期内刷屏）
+	driftWarned map[string]bool
 }
 
 // New 构建客户端。

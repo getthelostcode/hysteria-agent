@@ -235,6 +235,23 @@ func (c *Client) configApplyTimeout() time.Duration {
 	return 180 * time.Second
 }
 
+// logDriftOnce 同一类漂移只提示一次（心跳 30s 一次，刷屏会让 journal 没法看）。
+func (c *Client) logDriftOnce(msg string) {
+	c.mu.Lock()
+	if c.driftWarned == nil {
+		c.driftWarned = map[string]bool{}
+	}
+	if c.driftWarned[msg] {
+		c.mu.Unlock()
+
+		return
+	}
+	c.driftWarned[msg] = true
+	c.mu.Unlock()
+
+	c.log.Warn("节点现状与 agent 配置不一致", "detail", msg)
+}
+
 func (c *Client) sendRESTHeartbeat(ctx context.Context) {
 	path := c.cfg.Control.RESTHeartbeatPath
 	if path == "" {
@@ -253,17 +270,29 @@ func (c *Client) sendRESTHeartbeat(ctx context.Context) {
 		SentAtMs:        time.Now().UnixMilli(),
 	}
 
-	// 面板照抄节点现状：证书路径 + trafficStats（secret 用配置里的，没有才回退到 agent 自己的）
+	// 面板照抄节点现状 —— 注意取哪个值：
+	//   * trafficStats.secret 必须是 **agent 自己的 hysteria.api_secret**：校验比的就是它，
+	//     用配置文件里的值会让「配置里的 secret ≠ api_secret」这种漂移被原样抄回面板，
+	//     于是发布永远失败（jp8 现场）。
+	//   * listen 取 agent 的 api_base_url：hysteria 绑在哪、agent 读哪里，写回配置后两者一致。
+	//   * 证书路径取配置文件里的（校验就是看这些文件在不在）。
 	shape := readHysteriaShape(c.cfg.Hysteria.ConfigPath)
 	body.CertPath = shape.CertPath
 	body.KeyPath = shape.KeyPath
-	body.TrafficStatsListen = shape.StatsListen
-	body.TrafficStatsSecret = shape.StatsSecret
+
+	body.TrafficStatsSecret = c.cfg.Hysteria.APISecret
 	if body.TrafficStatsSecret == "" {
-		body.TrafficStatsSecret = c.cfg.Hysteria.APISecret
+		body.TrafficStatsSecret = shape.StatsSecret
 	}
+
+	body.TrafficStatsListen = strings.TrimPrefix(strings.TrimPrefix(c.cfg.Hysteria.APIBaseURL, "http://"), "https://")
 	if body.TrafficStatsListen == "" {
-		body.TrafficStatsListen = strings.TrimPrefix(strings.TrimPrefix(c.cfg.Hysteria.APIBaseURL, "http://"), "https://")
+		body.TrafficStatsListen = shape.StatsListen
+	}
+
+	// 漂移要能被发现：配置里的值与 agent 实际使用的不一致时，流量统计会 401。
+	if shape.StatsSecret != "" && c.cfg.Hysteria.APISecret != "" && shape.StatsSecret != c.cfg.Hysteria.APISecret {
+		c.logDriftOnce("trafficStats.secret 与 agent 的 hysteria.api_secret 不一致（流量统计会 401）：跑一次 `hysteria-agent config sync` 让控制面重新下发即可对齐")
 	}
 
 	_ = struct{}{}

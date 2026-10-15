@@ -82,6 +82,9 @@ func TestRESTFallbackHeartbeatIsIndependentOfConfigApply(t *testing.T) {
 		t.Fatalf("write hysteria cfg: %v", err)
 	}
 	cfg.Hysteria.ConfigPath = hyCfg
+	// agent 侧的值与配置文件刻意不同：上报必须是 agent 自己的（校验比的就是它）
+	cfg.Hysteria.APISecret = "agent-side-secret"
+	cfg.Hysteria.APIBaseURL = "http://127.0.0.1:8080"
 	cfg.Control.ConfigPollSeconds = 1
 	cfg.Control.ConfigApplyTimeoutSeconds = 600 // 应用永远不会超时返回
 	cfg.StateDir = dir
@@ -126,10 +129,17 @@ func TestRESTFallbackHeartbeatIsIndependentOfConfigApply(t *testing.T) {
 	if raw == "" {
 		t.Fatalf("没有捕获到心跳正文")
 	}
-	for _, want := range []string{"/etc/hysteria/cert.pem", "/etc/hysteria/key.pem", "127.0.0.1:9999", "node-side-secret", "traffic_stats_secret"} {
+	for _, want := range []string{
+		"/etc/hysteria/cert.pem", "/etc/hysteria/key.pem", // 证书路径来自配置文件（校验看文件在不在）
+		"agent-side-secret", "127.0.0.1:8080", // secret/listen 必须来自 agent 配置（校验比的就是它）
+		"traffic_stats_secret",
+	} {
 		if !strings.Contains(raw, want) {
 			t.Fatalf("心跳正文缺少 %q：%s", want, raw)
 		}
+	}
+	if strings.Contains(raw, "node-side-secret") {
+		t.Fatalf("不得把配置文件里的 secret 当权威值上报（会让面板抄回错值）：%s", raw)
 	}
 
 	cancel()
