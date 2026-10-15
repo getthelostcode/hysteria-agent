@@ -1,0 +1,47 @@
+[Unit]
+Description=Hysteria2 Node Agent (hysteria-agent)
+Documentation=file:/usr/local/share/doc/hysteria-agent/README.md
+# 需要网络就绪：Agent 启动后会立刻连接控制面
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/hysteria-agent run -config /etc/hysteria-agent/config.yaml
+Restart=always
+RestartSec=3
+
+# Agent 自己守护 Hysteria 子进程（hysteria.mode=process），
+# 停止时用 control-group 让子进程一起收尸，避免孤儿进程占着 443。
+KillMode=control-group
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+# Hysteria 是 QUIC 服务，连接数高，文件描述符要放宽
+LimitNOFILE=1048576
+# QUIC 需要较大的 socket 缓冲（与 Hysteria 官方建议一致）
+LimitMEMLOCK=infinity
+
+# --- 安全加固 ---
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+ProtectSystem=full
+# 需要可写的目录：
+#   /etc/hysteria-agent  凭据、配置历史（回滚用）
+#   /etc/hysteria        Hysteria 的配置（Agent 负责原子写入）
+#   /var/lib/hysteria-agent  outbox、state.json、升级工作目录
+#   /usr/local/bin       自升级需要原子替换自身二进制（若禁用升级可去掉这一项）
+ReadWritePaths=/etc/hysteria-agent /etc/hysteria /var/lib/hysteria-agent /run/hysteria-agent /usr/local/bin
+
+# 以 root 运行：需要绑定 443/tcp+udp、读写 /etc/hysteria、管理子进程。
+# 如果只想降权，可设 User=hysteria，但要自行保证 /etc/hysteria 可写、端口有 CAP_NET_BIND_SERVICE。
+#AmbientCapabilities=CAP_NET_BIND_SERVICE
+#User=hysteria
+
+[Install]
+WantedBy=multi-user.target

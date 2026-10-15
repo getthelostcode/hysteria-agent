@@ -1,0 +1,298 @@
+// hysteria-agent 控制通道协议
+//
+// 传输：WSS（TLS 1.3）+ 二进制帧。每一帧 = 一个 Envelope 的 protobuf 序列化结果，
+// 不额外套 varint 长度前缀（WebSocket 自带消息边界）。
+//
+// 为什么不用 gRPC bidi：控制面是多语言的（Go / Python-FastAPI / Laravel），
+// 且节点与控制面之间常经过 Cloudflare Tunnel。cloudflared 默认的 http 协议下
+// gRPC（HTTP/2 双向流）需要额外开启 --protocol http2 并且对 100s 空闲超时很敏感；
+// WebSocket 在隧道里开箱即用、可 keepalive，服务端用任何语言实现都不需要 gRPC 代码生成。
+// 逻辑上的"独立 stream"由 Envelope.type + command_id + seq 实现（多路复用同一条 TCP）。
+syntax = "proto3";
+
+package hysteria.agent.v1;
+
+option go_package = "github.com/getthelostcode/hysteria-agent/gen/agentpb;agentpb";
+
+// ---------------------------- 信封 ----------------------------
+
+// 当前协议版本。语义不兼容变更时 +1，双向都必须在 Hello/HelloAck 里声明。
+enum ProtocolVersion {
+  PROTOCOL_VERSION_UNSPECIFIED = 0;
+  PROTOCOL_VERSION_V1 = 1;
+}
+
+// 消息类型。与 body 一一对应，冗余声明一遍是为了让 Python/PHP 这类
+// 没有 oneof 惯用法的实现可以先 switch type 再解析，避免解析歧义。
+enum MsgType {
+  MSG_TYPE_UNSPECIFIED = 0;
+  MSG_TYPE_HELLO = 1;
+  MSG_TYPE_HELLO_ACK = 2;
+  MSG_TYPE_HEARTBEAT = 3;
+  MSG_TYPE_HEARTBEAT_ACK = 4;
+  MSG_TYPE_CONFIG_PUSH = 5;
+  MSG_TYPE_CONFIG_ACK = 6;
+  MSG_TYPE_COMMAND = 7;
+  MSG_TYPE_COMMAND_RESULT = 8;
+  MSG_TYPE_COMMAND_CHUNK = 9;
+  MSG_TYPE_LOG_BATCH = 10;
+  MSG_TYPE_METRIC_BATCH = 11;
+  MSG_TYPE_EVENT_ACK = 12;
+  MSG_TYPE_ERROR = 13;
+  MSG_TYPE_UPGRADE_OFFER = 14;
+  MSG_TYPE_NODE_EVENT = 15;
+}
+
+message Envelope {
+  uint32 protocol_version = 1; // PROTOCOL_VERSION_V1
+  MsgType type = 2;
+  // Agent -> 控制面 的单调递增事件序号。需要可靠投递的消息（日志/指标/命令结果/配置回执）
+  // 必须带 seq>0；控制面用 EventAck.acked_seq 累积确认。0 表示无需 ack 的实时消息。
+  uint64 seq = 3;
+  string trace_id = 4;
+  int64 ts_ms = 5;
+  string node_id = 6;
+
+  oneof body {
+    Hello hello = 10;
+    HelloAck hello_ack = 11;
+    Heartbeat heartbeat = 12;
+    HeartbeatAck heartbeat_ack = 13;
+    ConfigPush config_push = 20;
+    ConfigAck config_ack = 21;
+    CommandRequest command = 30;
+    CommandResult command_result = 31;
+    CommandChunk command_chunk = 32;
+    LogBatch logs = 40;
+    MetricBatch metrics = 41;
+    EventAck event_ack = 50;
+    ErrorMsg error = 60;
+    UpgradeOffer upgrade_offer = 70;
+    NodeEvent node_event = 71;
+  }
+}
+
+// ---------------------------- 握手 ----------------------------
+
+message Hello {
+  string node_id = 1;
+  string agent_version = 2;
+  string hysteria_version = 3;
+  string hostname = 4;
+  string os = 5;   // runtime.GOOS
+  string arch = 6; // runtime.GOARCH
+  string kernel = 7;
+  string boot_id = 8; // /proc/sys/kernel/random/boot_id，用于识别"重启过"
+  // 本地 outbox 中最小未被确认的 seq（断线期间缓存的事件从这里补发）。
+  uint64 resume_from_seq = 9;
+  uint64 last_acked_seq = 10;
+  repeated string capabilities = 11; // 例如 reload_config / upgrade_agent / tail_logs
+  int64 start_time_ms = 12;          // agent 进程启动时间
+  string config_sha256 = 13;         // 当前生效的 hysteria 配置哈希（控制面可据此判断是否漂移）
+  string config_revision = 14;
+  bool hysteria_running = 15;
+}
+
+message HelloAck {
+  int64 server_time_ms = 1;
+  uint32 heartbeat_interval_seconds = 2; // 默认 30
+  uint32 heartbeat_timeout_seconds = 3;  // 默认 90
+  uint32 telemetry_interval_seconds = 4; // 默认 15
+  // 控制面要求从哪个 seq 开始补发（通常是它已确认的最大 seq + 1）。
+  uint64 resend_from_seq = 5;
+  string config_revision = 6; // 控制面当前期望的配置版本
+  repeated string accepted_commands = 7;
+  string server_version = 8;
+}
+
+// ---------------------------- 心跳 ----------------------------
+
+message Heartbeat {
+  int64 ts_ms = 1;
+  uint64 uptime_seconds = 2;
+  uint64 pending_events = 3; // outbox 中未确认事件数（控制面可据此判断积压）
+  bool hysteria_running = 4;
+  bool ready = 5;
+  string config_revision = 6;
+  uint64 last_acked_seq = 7;
+  uint64 sent_events = 8; // 累计已投递事件数
+}
+
+message HeartbeatAck {
+  int64 server_time_ms = 1;
+  string config_revision = 2;
+  uint64 acked_seq = 3; // 累积确认
+}
+
+// ---------------------------- 配置下发 ----------------------------
+
+message ConfigPush {
+  string revision = 1;   // 控制面侧版本号（字符串，例如 20261015-3）
+  string format = 2;     // yaml | json
+  bytes payload = 3;     // 配置正文
+  string sha256 = 4;     // payload 的 sha256（hex），Agent 必须校验
+  bytes signature = 5;   // 可选：ed25519(payload sha256 的 hex 字符串)，配置签名
+  string reason = 6;     // 变更原因，写进审计日志
+  int64 deadline_ms = 7;
+  bool force = 8;        // 跳过"与当前配置相同"的短路判断
+  bool dry_run = 9;      // 只校验不落盘
+}
+
+message ConfigAck {
+  string revision = 1;
+  bool ok = 2;
+  string error = 3;
+  string previous_revision = 4;
+  string sha256 = 5;
+  repeated string warnings = 6;
+  int64 duration_ms = 7;
+  bool rolled_back = 8;  // 应用失败后是否已回滚到上一版本
+  bool dry_run = 9;
+  repeated string checks = 10; // 校验明细："schema:ok" "port:ok" "cert:expires_in=45d"
+}
+
+// ---------------------------- 远程指令 ----------------------------
+//
+// 白名单：Agent 只实现下面这些指令，任何情况下都不执行任意 shell。
+enum CommandType {
+  COMMAND_TYPE_UNSPECIFIED = 0;
+  COMMAND_TYPE_RELOAD_CONFIG = 1;   // 重载（= 校验 + 应用当前/指定配置 + 平滑重启）
+  COMMAND_TYPE_RESTART_HYSTERIA = 2;
+  COMMAND_TYPE_UPGRADE_AGENT = 3;   // 自升级（验签 + 原子替换 + exec）
+  COMMAND_TYPE_RUN_DIAGNOSTIC = 4;  // 健康检查报告
+  COMMAND_TYPE_TAIL_LOGS = 5;       // 流式推送日志，最长 5 分钟
+  COMMAND_TYPE_KICK_USERS = 6;      // 调 Hysteria /kick 踢用户
+  COMMAND_TYPE_GET_STATE = 7;       // 返回 agent + hysteria 运行状态快照
+  COMMAND_TYPE_CANCEL_TAIL = 8;     // 提前结束 TAIL_LOGS
+  COMMAND_TYPE_ROLLBACK_CONFIG = 9; // 回滚到上一个/指定配置版本
+  COMMAND_TYPE_SELF_RESTART = 10;   // 仅重启 agent（systemd restart）
+  COMMAND_TYPE_CLEAR_OUTBOX = 11;   // 丢弃本地积压事件（危险，需显式确认）
+}
+
+enum CommandStatus {
+  COMMAND_STATUS_UNSPECIFIED = 0;
+  COMMAND_STATUS_OK = 1;
+  COMMAND_STATUS_FAILED = 2;
+  COMMAND_STATUS_REJECTED = 3; // 白名单外 / 校验不通过
+  COMMAND_STATUS_TIMEOUT = 4;
+}
+
+message CommandRequest {
+  string command_id = 1; // 幂等键：同一 command_id 重复下发只执行一次
+  CommandType type = 2;
+  bytes params_json = 3; // 指令参数（各指令自定义，见 DESIGN.md）
+  int64 deadline_ms = 4;
+  string trace_id = 5;
+}
+
+message CommandResult {
+  string command_id = 1;
+  CommandStatus status = 2;
+  string error = 3;
+  bytes result_json = 4;
+  int64 started_ms = 5;
+  int64 finished_ms = 6;
+  CommandType type = 7;
+}
+
+// 流式指令（TAIL_LOGS）的分片。index 从 0 递增，最后一片 eof=true。
+message CommandChunk {
+  string command_id = 1;
+  uint32 index = 2;
+  bytes data = 3;
+  bool eof = 4;
+  string error = 5;
+}
+
+// ---------------------------- 日志 / 指标 ----------------------------
+
+message LogEntry {
+  int64 ts_ms = 1;
+  string level = 2;     // debug|info|warn|error
+  string component = 3; // agent|hysteria|control|supervisor|hyconfig|upgrade|diag
+  string msg = 4;
+  string trace_id = 5;
+  bytes fields_json = 6; // 结构化附加字段
+  uint64 id = 7;         // 本地环缓冲序号
+}
+
+message LogBatch {
+  repeated LogEntry entries = 1;
+  string source = 2; // agent | hysteria
+}
+
+message MetricSample {
+  int64 ts_ms = 1;
+  double cpu_percent = 2;
+  uint64 mem_total_bytes = 3;
+  uint64 mem_used_bytes = 4;
+  double mem_percent = 5;
+  uint64 disk_total_bytes = 6;
+  uint64 disk_used_bytes = 7;
+  double disk_percent = 8;
+  uint64 net_rx_bytes = 9; // 自上次采样以来的增量
+  uint64 net_tx_bytes = 10;
+  double load1 = 11;
+  double load5 = 12;
+  double load15 = 13;
+  uint64 uptime_seconds = 14;
+  uint32 proc_count = 15;
+}
+
+message HysteriaStats {
+  bool running = 1;
+  int32 pid = 2;
+  uint64 uptime_seconds = 3;
+  string version = 4;
+  uint64 active_users = 5;   // /traffic 里出现过的用户数（会话窗口内）
+  uint64 online_devices = 6; // /online 求和
+  uint64 tx_bytes = 7;       // 自上次上报以来的增量
+  uint64 rx_bytes = 8;
+  uint64 conns = 9;          // 在线设备数（连接数近似）
+  int32 last_exit_code = 10;
+  uint64 restart_count = 11;
+}
+
+message MetricBatch {
+  MetricSample sample = 1;
+  HysteriaStats hysteria = 2;
+  string agent_version = 3;
+  string config_revision = 4;
+  map<string, string> labels = 5;
+}
+
+// ---------------------------- 其它 ----------------------------
+
+message EventAck {
+  uint64 acked_seq = 1; // 累积确认：seq <= acked_seq 的事件已落库，可以丢弃
+}
+
+message ErrorMsg {
+  string code = 1;
+  string message = 2;
+  bool fatal = 3;
+}
+
+message UpgradeOffer {
+  string version = 1;
+  string url = 2;
+  string sha256 = 3;
+  bytes signature = 4; // ed25519(sha256 hex)
+  int64 size = 5;
+  bool force = 6;
+  string notes = 7;
+}
+
+// NodeEvent 是节点侧发生的、需要控制面记一笔的事情：
+// 子进程起停/崩溃（带退出码与日志尾巴）、配置应用与回滚、升级、放弃重启等。
+// 它与日志的区别是"有明确语义、要落库/告警"，所以单独一种消息类型，而不是混在日志流里。
+message NodeEvent {
+  string type = 1; // started|exited|restart_scheduled|restart_gave_up|stopped|config_applied|config_failed|config_rolled_back|upgrade|outbox_dropped
+  int64 ts_ms = 2;
+  int32 exit_code = 3;
+  string pid = 4;
+  string reason = 5;
+  bytes data_json = 6;
+  repeated string log_tail = 7;
+  string revision = 8;
+}

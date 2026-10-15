@@ -1,0 +1,126 @@
+# hysteria-agent 配置模板（/etc/hysteria-agent/config.yaml，权限 0600）
+#
+# 最小可用配置只需要 control.server_url；其余都有默认值。
+# 下面前带 [默认] 的注释说明该键的默认值，删掉整块不影响运行。
+# 与 README「配置表」一一对应，改完可以跑 `hysteria-agent diag` 自检。
+
+control:
+  # 控制面地址。ws:// 只在本地联调时使用，必须同时设置 allow_insecure_ws: true
+  server_url: "https://cp.example.com"
+  ws_path: "/api/v1/agent/control"        # 控制通道（WebSocket）路径
+  enroll_path: "/api/v1/agent/enroll"     # 注册接口路径
+  token_path: "/api/v1/agent/token"       # 可选：用 node_secret 换 JWT 的接口
+  user_agent: "hysteria-agent"
+  ca_file: ""                             # 私有 CA（PEM）；留空用系统根证书
+  pin_sha256: []                          # 证书 SPKI pin（base64），非空则强制 pinning
+  insecure_skip_verify: false             # 只有同时配了 pin 才允许设为 true
+  allow_insecure_ws: false                # 允许 ws:// 明文（仅本地联调）
+
+  connect_timeout_seconds: 15
+  handshake_timeout_seconds: 20
+  write_timeout_seconds: 15
+  read_timeout_seconds: 120
+  heartbeat_interval_seconds: 30          # 心跳间隔（控制面可在 HelloAck 里覆盖）
+  heartbeat_timeout_seconds: 90           # 超时视为断线
+  telemetry_interval_seconds: 15          # 遥测间隔（控制面可覆盖）
+  jwt_expiry_seconds: 3600                # 本地自签 JWT 的有效期
+  max_message_bytes: 4194304
+  token_refresh_leeway_seconds: 300
+  reconnect:                              # 指数退避 + 抖动
+    initial_seconds: 1
+    max_seconds: 300                      # 需求上限：5 分钟
+    multiplier: 2
+    jitter: 0.2
+
+credentials_file: "/etc/hysteria-agent/credentials.json"  # 权限 0400，由 enroll 写入
+state_dir: "/var/lib/hysteria-agent"
+runtime_dir: "/run/hysteria-agent"
+
+hysteria:
+  # process  = Agent 直接拉起并守护 hysteria 子进程（推荐，能力最全）
+  # systemd  = Hysteria 由 systemd 管理，Agent 通过 systemctl 白名单动词操作
+  # external = 只观测不管理
+  mode: "process"
+  binary: "/usr/local/bin/hysteria"
+  config_path: "/etc/hysteria/config.yaml"
+  service_name: "hysteria-server"
+  work_dir: ""                            # 子进程工作目录（留空为 /）
+  env: []                                 # 追加环境变量，如 ["HYSTERIA_LOG_LEVEL=debug"]
+  extra_args: []                          # 追加命令行参数（不要放 -c，会冲突）
+  api_base_url: "http://127.0.0.1:8080"   # Hysteria 的 trafficStats.listen
+  api_secret: ""                          # 必须与配置里 trafficStats.secret 一致
+  log_paths: []                           # 额外可读日志文件（tail_logs 用）
+  journal_unit: "hysteria-server"         # non-process 模式下允许 journalctl -u 该单元
+
+  startup_timeout_seconds: 20             # 启动后等待就绪的上限
+  shutdown_timeout_seconds: 15            # SIGTERM 优雅停止的上限，超时 SIGKILL
+  restart:                                # 崩溃重启退避
+    initial_seconds: 1
+    max_seconds: 60
+    multiplier: 2
+    jitter: 0.2
+  restart_max_in_window: 10               # 窗口内重启上限，超过则放弃并上报
+  restart_window_seconds: 300
+
+  history_dir: "/etc/hysteria-agent/history"  # 配置历史（保留最近 N 个版本）
+  history_keep: 5
+  validate_port: true                     # 下发时检查端口占用
+  validate_cert: true                     # 下发时检查证书有效期/配对
+  cert_expiry_warn_days: 14
+
+telemetry:
+  interval_seconds: 15
+  disk_paths: ["/", "/var/lib/hysteria-agent"]
+  net_interfaces: []                      # 空 = 所有非 lo 接口
+  hysteria_enabled: true                  # 从 Hysteria 本地 API 采集流量/在线数
+
+logs:
+  level: "info"                           # debug|info|warn|error
+  format: "json"                          # 结构化日志（systemd/journald 收集）
+  remote_enabled: true                    # 经控制通道上传日志
+  ring_size: 2000                         # 本地环形缓冲（tail_logs 回放）
+  include_hysteria: true                  # 把 hysteria 子进程 stdout 一起采集
+  sample:                                 # 采样/限速（防日志风暴打爆控制面）
+    max_lines_per_second: 200
+    burst: 500
+    min_level: "info"
+    max_batch: 100
+    flush_interval_ms: 500
+    max_line_bytes: 8192
+
+metrics:
+  enabled: true
+  listen: "127.0.0.1:9100"                # 只监听本地
+  path: "/metrics"
+  health_path: "/healthz"
+  ready_path: "/readyz"
+
+outbox:                                   # 断线期间的事件缓冲（JSONL，原子重写）
+  path: "/var/lib/hysteria-agent/outbox.jsonl"
+  max_bytes: 33554432
+  max_events: 20000
+  fsync: true
+  compact_min_drops: 64
+
+upgrade:
+  enabled: true                           # 没有可用验签公钥时必须设为 false
+  pubkeys: []                             # base64 ed25519 公钥（可多把，支持轮换）
+  binary_path: "/usr/local/bin/hysteria-agent"
+  work_dir: "/var/lib/hysteria-agent/upgrade"
+  allow_downgrade: false
+  download_timeout_seconds: 120
+  smoke_test_seconds: 10                  # 替换前跑 `version` 冒烟测试
+  restart_mode: "systemd"                 # systemd | exec
+  service_name: "hysteria-agent"
+
+diag:
+  dns_hosts: []                           # 额外要解析的域名
+  public_ip_urls: ["https://api.ipify.org"]  # 出口 IP 检查（留空跳过）
+  port_check_timeout_ms: 800
+  http_timeout_ms: 5000
+  check_control_plane: true
+
+tail_logs:
+  max_duration_seconds: 300               # 需求硬上限：5 分钟
+  max_line_bytes: 8192
+  max_chunk_bytes: 16384
