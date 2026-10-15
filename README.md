@@ -57,6 +57,15 @@ hysteria-agent enroll --token=<面板生成的一次性令牌>                 #
 
 * 注册被**原样代理**到 Laravel：返回的 `node_id` / `node_secret` 就是 Laravel 下发的，
   面板立刻能看到该节点（同一个 `node_id`）；`401/409` 等状态码与响应体原样透传。
+* 心跳 / 遥测 / 日志 / 诊断报告由控制面**转发**到 Laravel（`POST /api/agent/v1/{heartbeat,metrics,logs,diagnostics}`）：
+  agent 只跟控制面打交道，队列表格/曲线/日志全部落在面板侧。转发走 per-node 后台队列，
+  agent 的消息处理路径永不阻塞（丢弃/失败都进 `/metrics` 的 `cp_bridge_*` 计数）。
+
+真机验收（需要 Laravel 面板在跑）：
+
+```bash
+PANEL_URL=http://127.0.0.1:8001 bash tests/bridge_e2e.sh     # 14 项断言
+```
 * 本控制面把 per-node secret 存进 `state.json`（0600），用于替节点签 REST（S4 起）。
 * 老的独立模式（`authority: local`，node_secret 由 master_key 派生）保持可用，升级后行为不变。
 * 自检：`go run ./cmd/cpapi-smoke -cp https://cp.example.com -email <admin> -password <pw>`

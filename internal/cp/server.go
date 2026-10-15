@@ -63,6 +63,10 @@ type Server struct {
 	conns   map[string]*session   // node_id -> 活跃会话
 	waiters map[string][]chan any // node_id -> 等待回执的通道
 	metrics *Metrics
+
+	// 桥接（identity.authority=laravel）：node_id -> 转发器
+	bridgeMu sync.Mutex
+	bridges  map[string]*forwarder
 }
 
 // session 是一条控制通道连接。
@@ -78,19 +82,28 @@ type session struct {
 
 // Metrics 是控制面的进程内计数器。
 type Metrics struct {
-	mu             sync.Mutex
-	EnrollTotal    int64
-	EnrollFailed   int64
-	WSConnected    int64
-	WSRejected     int64
-	Heartbeats     int64
-	EventsTotal    int64
-	Duplicates     int64
-	CommandsSent   int64
-	CommandsDone   int64
-	PushesSent     int64
-	PushApplied    int64
-	PushFailed     int64
+	mu           sync.Mutex
+	EnrollTotal  int64
+	EnrollFailed int64
+	WSConnected  int64
+	WSRejected   int64
+	Heartbeats   int64
+	EventsTotal  int64
+	Duplicates   int64
+	CommandsSent int64
+	CommandsDone int64
+	PushesSent   int64
+	PushApplied  int64
+	PushFailed   int64
+
+	// 桥接转发计数（identity.authority=laravel）
+	BridgeHeartbeats int64
+	BridgeMetrics    int64
+	BridgeLogs       int64
+	BridgeDiags      int64
+	BridgeFailed     int64
+	BridgeDropped    int64
+
 	CfgStateCounts map[string]int64
 }
 
@@ -131,6 +144,7 @@ func New(cfg *Config, store *Store, log *slog.Logger) *Server {
 		conns:   map[string]*session{},
 		waiters: map[string][]chan any{},
 		metrics: newMetrics(),
+		bridges: map[string]*forwarder{},
 	}
 }
 
@@ -262,6 +276,8 @@ func (s *Server) handleControl(w http.ResponseWriter, r *http.Request) {
 	nodeID := strings.TrimSpace(r.Header.Get("X-Node-ID"))
 	if tok == "" || nodeID == "" {
 		s.metrics.bump("ws_rejected")
+		s.log.Warn("控制通道拒绝：缺少 Authorization Bearer 令牌或 X-Node-ID",
+			"has_authorization", tok != "", "has_node_id", nodeID != "", "remote", r.RemoteAddr)
 		writeErr(w, http.StatusUnauthorized, "缺少 Authorization Bearer 令牌或 X-Node-ID")
 		return
 	}
@@ -282,6 +298,8 @@ func (s *Server) handleControl(w http.ResponseWriter, r *http.Request) {
 	}
 	if aud, _ := claims["aud"].(string); aud != creds.DefaultAudience {
 		s.metrics.bump("ws_rejected")
+		s.log.Warn("控制通道拒绝：JWT audience 不匹配（agent 用的 audience 与凭据里的不一致）",
+			"node_id", nodeID, "got", aud, "want", creds.DefaultAudience)
 		writeErr(w, http.StatusUnauthorized, "JWT audience 不匹配")
 		return
 	}
@@ -428,6 +446,13 @@ func (s *Server) onMessage(sess *session, env *agentpb.Envelope) {
 			AcceptedCommands:         wire.CommandWhitelist(),
 			ServerVersion:            version.Version,
 		}))
+		// 桥接：Hello 后立刻转发一次心跳，让面板立刻看到节点在线（不等第一个 30s 心跳）。
+		s.bridgeHeartbeat(nodeID, &agentpb.Heartbeat{
+			TsMs:            time.Now().UnixMilli(),
+			HysteriaRunning: false,
+			Ready:           false,
+			ConfigRevision:  h.GetConfigRevision(),
+		})
 		return
 
 	case *agentpb.Envelope_Heartbeat:
@@ -453,6 +478,8 @@ func (s *Server) onMessage(sess *session, env *agentpb.Envelope) {
 		s.send(sess, wire.New(agentpb.MsgType_MSG_TYPE_HEARTBEAT_ACK, &agentpb.HeartbeatAck{
 			ServerTimeMs: time.Now().UnixMilli(), AckedSeq: acked,
 		}))
+		// 桥接：转发给 Laravel（面板的 last_seen_at / 在线判定由它负责）。
+		s.bridgeHeartbeat(nodeID, hb)
 		if seq > 0 {
 			s.ack(sess, seq)
 		}
@@ -557,6 +584,7 @@ func (s *Server) onMessage(sess *session, env *agentpb.Envelope) {
 
 	case *agentpb.Envelope_Metrics:
 		m := b.Metrics
+		s.bridgeMetrics(nodeID, m)
 		info := summarizeMetrics(m)
 		s.store.Mutate(nodeID, func(n *Node) { n.LastMetrics = info })
 		persist = map[string]any{"sample": m.GetSample(), "hysteria": m.GetHysteria(),
@@ -565,6 +593,7 @@ func (s *Server) onMessage(sess *session, env *agentpb.Envelope) {
 
 	case *agentpb.Envelope_Logs:
 		l := b.Logs
+		s.bridgeLogs(nodeID, l)
 		kind, etype = "logs", "LogBatch"
 		msg = fmt.Sprintf("%d 条来自 %s", len(l.GetEntries()), l.GetSource())
 		persist = map[string]any{"source": l.GetSource(), "entries": l.GetEntries()}
@@ -873,6 +902,18 @@ func (m *Metrics) bump(what string) {
 		m.PushApplied++
 	case "push_failed":
 		m.PushFailed++
+	case "bridge_heartbeat":
+		m.BridgeHeartbeats++
+	case "bridge_metrics":
+		m.BridgeMetrics++
+	case "bridge_logs":
+		m.BridgeLogs++
+	case "bridge_diagnostics":
+		m.BridgeDiags++
+	case "bridge_failed":
+		m.BridgeFailed++
+	case "bridge_dropped":
+		m.BridgeDropped++
 	}
 }
 

@@ -63,15 +63,17 @@ X-Node-Signature = HMAC-SHA256(secret, METHOD + "\n" + PATH + "\n" + sha256_hex(
 * `PATH` **不含查询串**；gzip 体签的是压缩后字节；
 * 时间偏移 ≤ `AGENT_SIGNATURE_TTL`（300s）；nonce 每个请求重新生成（重放会 409）。
 
+S4 已实现的部分（`internal/cp/bridge.go`）标 ✅：
+
 | agent 侧（Envelope） | Go 控制面调用的 Laravel 接口 | 触发时机 | 说明 |
 |---|---|---|---|
-| `Hello` | `POST /api/agent/v1/heartbeat` | 每次 WS 建连 | 顺带取回最新配置版本与待执行指令数 |
+| `Hello` ✅ | `POST /api/agent/v1/heartbeat` | 每次 WS 建连 | 顺带取回最新配置版本与待执行指令数；**额外立刻转一次心跳**，面板无需等 30s 就能看到节点在线 |
 | `HelloAck` 协商 | — | — | 间隔值来自 Laravel `settings.heartbeat_interval`（桥接器启动时拉一次，缓存 5 分钟） |
-| `Heartbeat` | `POST /api/agent/v1/heartbeat` | 30s（可协商） | Laravel 侧写库按节点 15s 门控 |
+| `Heartbeat` ✅ | `POST /api/agent/v1/heartbeat` | 30s（可协商） | Laravel 侧写库按节点 15s 门控 |
 | `ConfigPush` 需求 | `GET /api/agent/v1/config/latest?current_version=N` | 2s 轮询 + Reverb 事件立即触发 | Laravel 是配置发布方 |
 | `ConfigAck` | `POST /api/agent/v1/config/ack` | agent 回执后 | 失败 → Laravel **自动回滚**并置 node=error |
-| `MetricBatch` | `POST /api/agent/v1/metrics`（gzip） | 15s | 单批 ≤500，超出切分 |
-| `LogBatch` | `POST /api/agent/v1/logs` | 按 agent 采样批次 | agent 侧已做采样/截断 |
+| `MetricBatch` ✅ | `POST /api/agent/v1/metrics`（gzip） | 15s | 单批 ≤500，超出切分；`cpu/mem/disk` 压到 0..100（多核 CPU>100 会被 Laravel 422 掉整批），hysteria 明细进 `extra.hysteria` |
+| `LogBatch` ✅ | `POST /api/agent/v1/logs` | 按 agent 采样批次 | agent 侧已做采样/截断；按 500 条切分，level 做归一（`warn→warning`、`fatal/panic→critical`），否则 Laravel 按 info 存 |
 | `CommandRequest` | `POST /api/agent/v1/commands/poll` | 10s 兜底 + Reverb 立即触发 | 取到后转成 Envelope 下发 |
 | `CommandResult` | `POST /api/agent/v1/commands/{command_id}/ack` | agent 回执后 | `OK/REJECTED→ok`，`FAILED/TIMEOUT→failed` |
 | `CommandChunk`（tail_logs 流） | 缓存后随 `command/ack` 的 `result.chunks[]` 一并回传 | tail 结束 | 面板查看流式日志 |
@@ -227,13 +229,50 @@ bridge:
 | S7 | Go：降级 outbox 补发 | 停 Laravel → 产生遥测/回执 → 恢复后全部落到面板，无丢无重 |
 | S8 | 文档 + 部署（systemd 两份 unit、cloudflared 路径路由） | `install-controlplane.sh` 一键后 agent 可直接 enroll |
 
-## 11. 进度
+## 11. 桥接的消息处理模型（为什么不会拖慢 Agent 路径）
+
+每次转发都是一个 `bridgeJob`，进 per-node 的**有界队列**（256）后由**单个后台 worker 顺序执行**；
+Agent 的消息处理路径只做 `select { case ch <- job: default: }`，**永不阻塞**：
+
+* 队列满 → 丢弃 + `cp_bridge_failures_total{result="dropped"}`（S7 换成落盘 outbox 补发）；
+* 上游 5xx/超时 → 失败计数 + WARN 日志，worker 继续处理后续消息（重试策略在 `internal/cpapi`）；
+* 非桥接模式（`identity.authority: local`）→ 连转发器都不建，**零出站请求**（有单测守护）。
+
+观测：`GET /metrics` 的 `cp_bridge_total{kind=heartbeat|metrics|logs|diagnostics}` 与
+`cp_bridge_failures_total{result=failed|dropped}`。面板 5 秒内出现曲线/日志 = 验收通过。
+
+## 12. 真机验收（S4）
+
+```bash
+# 先用 hysteria-control-plane 起面板（8001/8088 均可）
+PANEL_URL=http://127.0.0.1:8001 \
+PANEL_DB=/root/hysteria-control-plane/database/database.sqlite \   # 可选：额外校验 node_logs 入库
+bash tests/bridge_e2e.sh
+```
+
+`tests/bridge_e2e.sh` 起真实 agent + 真实 Go 控制面（laravel 模式）+ 真实 Laravel 面板，
+断言 14 项：注册 → `credentials.json` 0400 → WS 握手完成 → 面板可见且 `online` →
+`meta.protocol=bridge/v1` → 指标曲线有样本 → `cp_bridge_total` 三类计数增长 → 日志入库。
+
+**踩坑（前两条都会让面板"看起来没数据"）**：
+
+1. **通道 JWT 的 issuer/audience 必须由控制面（校验方）决定**，不能透传 Laravel 注册响应里的值。
+   Laravel 兼容面曾返回 `jwt_audience=hysteria-agent`，而控制面按 `creds.DefaultAudience`
+   (`hysteria-control`) 校验 → WS 握手 401，agent 侧只能看到 "bad handshake"。
+   现在 enroll 代理一律回填 `creds.DefaultIssuer/DefaultAudience`，Laravel 兼容面也用同一组值。
+2. **401 分支必须打日志**。"缺头"与"audience 不匹配"两条分支原来只写响应不写日志，排查时 CP
+   日志干干净净，只能抓包/手工 curl；现在两条都带 `node_id`/`got`/`want`。
+3. `enroll --replace` 是**同一 node_id 轮换凭据**，面板侧保留原节点名 —— 脚本按
+   `credentials.json` 的 `node_id` 查询，而不是按新名字搜。
+
+## 13. 进度
 
 - [x] **S1** Laravel：6 个 agent 原生指令类型 + 危险类型限权 + 通道列（`hysteria-control-plane@97b6df1`）
 - [x] **S2** Go：`internal/cpapi` 签名客户端 + 11 单测（跨语言黄金向量）+ `cmd/cpapi-smoke`
 - [x] **S3** Go：`identity.authority: laravel` —— enroll 代理、per-node secret 入库（state.json 0600）、
       通道鉴权改用下发密钥、启动探活、409/401 原样透传
-- [ ] S4 心跳/遥测/日志转发  · [ ] S5 配置下发+回执（含失败自动回滚） · [ ] S6 指令双向 + Reverb 事件驱动
+- [x] **S4** Go：心跳/遥测/日志/诊断转发（`internal/cp/bridge.go` + 6 单测 + 真机 14 项断言全绿）
+       · [ ] S5 配置下发+回执（含失败自动回滚） · [ ] S6 指令双向 + Reverb 事件驱动
 - [ ] S7 Laravel 不可达时的 outbox 补发 · [ ] S8 部署（cloudflared 路径路由 + 两份 unit）
 
 约定：**路径与字段以 Laravel 侧为准**（它是契约发布方）；Go 侧只做映射，任何字段变动先改 Laravel 的 `docs/API.md` 与 OpenAPI（`/docs/api.json`），再同步 Go。

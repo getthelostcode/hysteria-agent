@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/getthelostcode/hysteria-agent/internal/cpapi"
+	"github.com/getthelostcode/hysteria-agent/internal/creds"
 )
 
 // upstreamError 保留 Laravel 的原始状态码与响应体，便于对 Agent 原样透传
@@ -54,7 +55,8 @@ func (s *Server) handleLaravelEnroll(w http.ResponseWriter, r *http.Request, req
 	s.store.AppendEvent(Event{NodeID: node.ID, Kind: "conn", Type: "enrolled",
 		Message: fmt.Sprintf("节点注册（身份来自 Laravel）：%s (%s/%s) agent=%s", node.Name, node.OS, node.Arch, node.AgentVersion)})
 	s.log.Info("节点已注册（Laravel 权威）", "node_id", node.ID, "name", node.Name,
-		"hostname", req.Hostname, "agent", req.AgentVersion, "config_revision", upstream.ConfigRevision)
+		"hostname", req.Hostname, "agent", req.AgentVersion, "agent_protocol", req.Protocol,
+		"config_revision", upstream.ConfigRevision)
 
 	hbInterval := s.cfg.Heartbeat.IntervalSeconds
 	if upstream.HeartbeatIntervalSeconds > 0 {
@@ -66,15 +68,17 @@ func (s *Server) handleLaravelEnroll(w http.ResponseWriter, r *http.Request, req
 	}
 
 	writeJSON(w, http.StatusOK, EnrollResponse{
-		NodeID:                   node.ID,
-		NodeSecret:               upstream.NodeSecret,
-		NodeName:                 node.Name,
-		ControlURL:               s.cfg.PublicURL,
-		WSPath:                   s.cfg.WSPath,
-		PinSHA256:                s.cfg.PinSHA256,
-		CACertPEM:                s.cfg.CACertPEM,
-		JWTIssuer:                firstNonEmpty(upstream.JWTIssuer, s.cfg.PublicURL),
-		JWTAudience:              firstNonEmpty(upstream.JWTAudience, "hysteria-agent"),
+		NodeID:     node.ID,
+		NodeSecret: upstream.NodeSecret,
+		NodeName:   node.Name,
+		ControlURL: s.cfg.PublicURL,
+		WSPath:     s.cfg.WSPath,
+		PinSHA256:  s.cfg.PinSHA256,
+		CACertPEM:  s.cfg.CACertPEM,
+		// 通道 JWT 的 issuer/audience 由**校验方**（本控制面）决定：agent 会用这两个值
+		// 自签，控制通道再按 creds.Default* 校验。透传上游值会导致 audience 不匹配 → 401。
+		JWTIssuer:                creds.DefaultIssuer,
+		JWTAudience:              creds.DefaultAudience,
 		HeartbeatIntervalSeconds: hbInterval,
 		TelemetryIntervalSeconds: telemetry,
 		ConfigRevision:           upstream.ConfigRevision,
@@ -98,8 +102,10 @@ func (s *Server) enrollViaLaravel(ctx context.Context, req EnrollRequest) (*cpap
 		BootID:          req.BootID,
 		AgentVersion:    req.AgentVersion,
 		HysteriaVersion: req.HysteriaVersion,
-		Protocol:        firstNonEmpty(req.Protocol, "bridge/v1"),
-		Replace:         req.Replace,
+		// 通道标记：Laravel 侧 nodes.meta.protocol=bridge/v1，面板可据此区分
+		// 「Go 控制面桥接」与「直连节点」；agent 自己的 protocol 版本号记在 CP 日志里。
+		Protocol: "bridge/v1",
+		Replace:  req.Replace,
 	})
 	if err != nil {
 		var apiErr *cpapi.APIError
