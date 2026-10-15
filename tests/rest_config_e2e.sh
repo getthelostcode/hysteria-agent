@@ -189,6 +189,11 @@ check "auth 段已是 HTTP 鉴权（面板模板原样落盘）" "grep -q 'url: 
 check "配置权限仍是 600" "[ \"\$(stat -c %a '$WORK/etc/hysteria/config.yaml')\" = '600' ]"
 check "旧配置留了版本历史（可回滚）" "ls '$WORK/etc/hysteria/history' 2>/dev/null | grep -q ."
 check "agent 日志记录了 REST 收到新配置" "grep -q 'REST 兜底：收到新配置' '$WORK/logs/agent.log'"
+# 回执是异步写盘 + 面板写库，直接 grep 会撞竞态（面板已 applied 但日志还没 flush）
+for _ in $(seq 1 10); do
+  grep -q 'REST 兜底：配置回执已送达' "$WORK/logs/agent.log" 2>/dev/null && break
+  sleep 1
+done
 check "agent 发回了配置回执" "grep -q 'REST 兜底：配置回执已送达' '$WORK/logs/agent.log'"
 check "agent 没有因为应用配置而重启整个服务（热重载）" "grep -q '配置更新 rev=$V1\\|热重载\\|reload' '$WORK/logs/agent.log'"
 
