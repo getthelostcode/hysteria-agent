@@ -18,7 +18,12 @@ COMMIT     := $(shell git rev-parse --short HEAD 2>/dev/null || echo dev)
 BUILD_TIME := $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
 GO         ?= /usr/local/go/bin/go
 DIST       := dist
+RELEASE    := release
+VERSION    ?= 0.1.0
 UPGRADE_PUBKEY ?=
+
+TARBALL_AMD64 := $(RELEASE)/hysteria-agent-$(VERSION)-linux-amd64.tar.gz
+TARBALL_ARM64 := $(RELEASE)/hysteria-agent-$(VERSION)-linux-arm64.tar.gz
 
 LDFLAGS := -s -w \
   -X $(MODULE)/internal/version.Version=$(VERSION) \
@@ -29,7 +34,7 @@ ifneq ($(UPGRADE_PUBKEY),)
 LDFLAGS += -X $(MODULE)/internal/version.UpgradePublicKey=$(UPGRADE_PUBKEY)
 endif
 
-.PHONY: all build tools proto test vet e2e dist clean install
+.PHONY: all build tools proto test vet e2e dist release clean install smoke-release
 
 all: build tools
 
@@ -66,6 +71,46 @@ dist: build
 	cd $(DIST) && sha256sum $(BIN)-linux-amd64 > $(BIN)-linux-amd64.sha256
 	@echo "--- 产物 ---"
 	@ls -l $(DIST)
+
+# release 产出"解压即可用"的完整包：
+#   hysteria-agent-<版本>-linux-<架构>/
+#     ├── bin/          agent + mockcontrol/mockhysteria/agent-sign（静态、无动态依赖）
+#     ├── install.sh    一键安装（会自动发现同包内的 bin/hysteria-agent）
+#     ├── deploy/       config.yaml + systemd 单元
+#     ├── README.md / DESIGN.md
+#     └── SHA256SUMS
+# 用法：make release            （amd64 + arm64）
+#      make UPGRADE_PUBKEY=xxx release   （把自升级验签公钥编进二进制）
+release:
+	rm -rf $(RELEASE)
+	@for arch in amd64 arm64; do \
+	  name=hysteria-agent-$(VERSION)-linux-$$arch; \
+	  dir=$(RELEASE)/$$name; \
+	  echo ">>> 构建 $$name"; \
+	  mkdir -p $$dir/bin; \
+	  CGO_ENABLED=0 GOOS=linux GOARCH=$$arch $(GO) build -trimpath \
+	    -ldflags '$(LDFLAGS) -X $(MODULE)/internal/version.Version=$(VERSION)' \
+	    -o $$dir/bin/$(BIN) ./cmd/hysteria-agent || exit 1; \
+	  CGO_ENABLED=0 GOOS=linux GOARCH=$$arch $(GO) build -trimpath -o $$dir/bin/mockcontrol ./cmd/mockcontrol || exit 1; \
+	  CGO_ENABLED=0 GOOS=linux GOARCH=$$arch $(GO) build -trimpath -o $$dir/bin/mockhysteria ./cmd/mockhysteria || exit 1; \
+	  CGO_ENABLED=0 GOOS=linux GOARCH=$$arch $(GO) build -trimpath -o $$dir/bin/agent-sign ./cmd/agent-sign || exit 1; \
+	  cp install.sh $$dir/install.sh; \
+	  mkdir -p $$dir/deploy; cp deploy/config.yaml deploy/hysteria-agent.service $$dir/deploy/; \
+	  cp README.md DESIGN.md $$dir/; \
+	  ( cd $$dir && sha256sum bin/* > SHA256SUMS ); \
+	  tar -czf $(RELEASE)/$$name.tar.gz -C $(RELEASE) $$name; \
+	done
+	( cd $(RELEASE) && sha256sum *.tar.gz > SHA256SUMS )
+	@echo "--- 发布产物 ---"
+	@ls -lh $(RELEASE)/*.tar.gz
+	@echo "--- 校验和（$(RELEASE)/SHA256SUMS）---"
+	@cat $(RELEASE)/SHA256SUMS
+	@echo "--- 每个包内的 bin 校验和见 <包>/SHA256SUMS ---"
+	@cat $(RELEASE)/hysteria-agent-$(VERSION)-linux-amd64/SHA256SUMS
+
+# smoke-release：用发布包里的二进制真跑一遍（enroll → 长连接 → /readyz 200）
+smoke-release:
+	bash tests/smoke_release.sh
 
 clean:
 	rm -rf bin $(DIST)

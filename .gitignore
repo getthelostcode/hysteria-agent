@@ -1,9 +1,12 @@
 # 构建产物
 /bin/
 
-# 发布产物（dist/ 里的二进制与校验和是入库的，便于直接部署）
+# 发布产物（tarball 与校验和入库，便于直接部署；解压出来的目录不入库）
 /dist/*.tmp
 /dist/*.new
+/release/*/
+!release/SHA256SUMS
+/release/*.tmp
 
 # 运行时数据（本地联调产生）
 /var/

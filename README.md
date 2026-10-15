@@ -35,7 +35,40 @@ Hysteria2 节点的**管理守护进程**：一条 WebSocket + Protobuf 长连�
 
 ## 快速开始
 
-### 一键安装（推荐）
+### 方式 0：用编译好的发布包（最快）
+
+仓库里已经带了编译好的静态二进制包（无需装 Go）：
+
+```bash
+# 1) 取包（仓库里就有）：release/hysteria-agent-0.1.0-linux-<amd64|arm64>.tar.gz
+tar -xzf hysteria-agent-0.1.0-linux-amd64.tar.gz
+cd hysteria-agent-0.1.0-linux-amd64
+
+# 2) 校验完整性（包内另有一份 bin/* 的 SHA256SUMS）
+sha256sum -c ../SHA256SUMS      # 校验 tarball 本身
+sha256sum -c SHA256SUMS         # 校验包内二进制
+
+# 3) 一键安装（脚本会自动发现同包内的 bin/hysteria-agent）
+bash install.sh https://cp.example.com --token=<enroll_token> --name=hk-node-1
+
+# 4) 看一眼状态
+./bin/hysteria-agent status
+./bin/hysteria-agent diag
+curl -s 127.0.0.1:9100/healthz && curl -s 127.0.0.1:9100/readyz
+```
+
+包内包含：`bin/{hysteria-agent,mockcontrol,mockhysteria,agent-sign}`（全部静态链接，`CGO_ENABLED=0`）、
+`install.sh`、`deploy/{config.yaml,hysteria-agent.service}`、`README.md`、`DESIGN.md`。
+
+需要自己重新构建发布包时：
+
+```bash
+make release                       # 产出 release/*.tar.gz（amd64 + arm64）+ SHA256SUMS
+make UPGRADE_PUBKEY=<base64 公钥> release   # 把自升级验签公钥编进二进制
+make smoke-release                 # 用发布包里的二进制真跑一遍（28 项断言）
+```
+
+### 方式 1：一键安装（推荐）
 
 ```bash
 # 1) 在节点机上（脚本会自己装 Hysteria、生成配置、装 systemd 单元、注册节点）
