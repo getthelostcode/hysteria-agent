@@ -106,3 +106,50 @@ func TestEnrollRequestCarriesTheDetectedPublicIP(t *testing.T) {
 		t.Fatalf("注册请求的既有字段不应被破坏: %v", body)
 	}
 }
+
+func TestDetectPublicIPPrefersIPv4OverIPv6(t *testing.T) {
+	v6 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("2001:4860:4860::8888"))
+	}))
+	defer v6.Close()
+
+	v4 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("203.0.113.7"))
+	}))
+	defer v4.Close()
+
+	cfg := config.Default()
+	cfg.Diag.PublicIPURLs = []string{v6.URL, v4.URL}
+
+	// 双栈机器上第一个端点很可能返回 v6；运维要的是可读可 ping 的 IPv4
+	if got := detectPublicIP(context.Background(), cfg, nil); got != "203.0.113.7" {
+		t.Fatalf("应优先返回 IPv4，实际 %q", got)
+	}
+}
+
+func TestDetectPublicIPFallsBackToIPv6WhenNoIPv4Exists(t *testing.T) {
+	v6 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("2606:4700:4700::1111"))
+	}))
+	defer v6.Close()
+
+	cfg := config.Default()
+	cfg.Diag.PublicIPURLs = []string{v6.URL}
+
+	// 纯 v6 主机：宁可显示 v6，也不要不显示
+	if got := detectPublicIP(context.Background(), cfg, nil); got != "2606:4700:4700::1111" {
+		t.Fatalf("纯 v6 环境应回退返回 v6 地址，实际 %q", got)
+	}
+}
+
+func TestIsIPv4(t *testing.T) {
+	if !isIPv4("203.0.113.7") || !isIPv4("8.8.8.8") {
+		t.Fatal("v4 地址应判定为 IPv4")
+	}
+
+	for _, ip := range []string{"2001:4860:4860::8888", "::1", "not-an-ip", ""} {
+		if isIPv4(ip) {
+			t.Fatalf("%q 不应判定为 IPv4", ip)
+		}
+	}
+}
