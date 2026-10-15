@@ -14,6 +14,10 @@ control:
   # 降级为定时打这个 REST 心跳端点；0 关闭。窗口到期后会重新尝试控制通道，
   # 所以控制面换成能终结 WS 的 Go 控制面后最迟一个窗口自动恢复。
   rest_heartbeat_path: "/api/v1/agent/heartbeat"
+  # REST 兜底时拉配置的端点；没有它面板「发布配置」到不了节点
+  rest_config_path: "/api/v1/agent/config/latest"
+  # 兜底时的配置轮询间隔（秒）
+  config_poll_seconds: 5
   rest_fallback_seconds: 300              # [默认 300] 0 = 关闭兜底
   user_agent: "hysteria-agent"
   ca_file: ""                             # 私有 CA（PEM）；留空用系统根证书

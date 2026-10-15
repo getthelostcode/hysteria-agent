@@ -35,7 +35,10 @@ type Control struct {
 	// RESTHeartbeatPath：控制通道不可用时的心跳兜底端点。控制面必须能终结
 	// /api/v1/agent/control 这个二进制 WS —— Laravel/PHP 终结不了（返回 501），
 	// 没有兜底的话节点除注册外与控制面再无任何往来，面板「最后心跳」永远是注册时刻。
-	RESTHeartbeatPath  string   `yaml:"rest_heartbeat_path"`
+	RESTHeartbeatPath string `yaml:"rest_heartbeat_path"`
+	// RESTConfigPath：REST 兜底时拉取配置的端点。没有它，控制面「发布配置」写进库就再无下文
+	// —— 本控制面终结不了二进制 WS，节点只能靠 REST 取配置。
+	RESTConfigPath     string   `yaml:"rest_config_path"`
 	UserAgent          string   `yaml:"user_agent"`
 	CAFile             string   `yaml:"ca_file"`
 	PinSHA256          []string `yaml:"pin_sha256"` // 证书 SPKI pin（base64）；空则不做 pinning
@@ -60,6 +63,9 @@ type Control struct {
 	// 退化为 REST 心跳的持续时长；0 关闭。到期后重新尝试控制通道（例如控制面换成了
 	// 能终结 WS 的 Go 控制面），所以两端都不会僵死。
 	RESTFallbackSeconds float64 `yaml:"rest_fallback_seconds"`
+
+	// ConfigPollSeconds：REST 兜底时轮询配置的间隔（默认 5s，与 Go 控制面的 poll.config_seconds 对齐）。
+	ConfigPollSeconds float64 `yaml:"config_poll_seconds"`
 }
 
 // Hysteria 被管理的 Hysteria2 服务端。
@@ -211,6 +217,7 @@ func Default() *Config {
 			EnrollPath:                "/api/v1/agent/enroll",
 			TokenPath:                 "/api/v1/agent/token",
 			RESTHeartbeatPath:         "/api/v1/agent/heartbeat",
+			RESTConfigPath:            "/api/v1/agent/config/latest",
 			UserAgent:                 "hysteria-agent",
 			ConnectTimeoutSeconds:     15,
 			HandshakeTimeoutSeconds:   20,
@@ -223,6 +230,7 @@ func Default() *Config {
 			MaxMessageBytes:           4 << 20,
 			TokenRefreshLeewaySeconds: 300,
 			RESTFallbackSeconds:       300,
+			ConfigPollSeconds:         5,
 			Reconnect:                 Reconnect{InitialSeconds: 1, MaxSeconds: 300, Multiplier: 2, Jitter: 0.2},
 		},
 		CredentialsFile: DefaultCredsPath,

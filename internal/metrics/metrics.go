@@ -30,9 +30,12 @@ type Metrics struct {
 	ControlUptime     prometheus.Gauge
 	HeartbeatSent     prometheus.Counter
 	HeartbeatAcked    prometheus.Counter
-	// REST 心跳兜底（控制通道端点不可用时，面板仍能看到节点在线）
+	// REST 心跳/配置兜底（控制通道端点不可用时）
 	RESTHeartbeats        prometheus.Counter
 	RESTHeartbeatFailures prometheus.Counter
+	RESTConfigPolls       prometheus.Counter
+	RESTConfigAcks        prometheus.Counter
+	RESTConfigFailures    prometheus.Counter
 	EventsSent            prometheus.Counter
 	EventsResent          prometheus.Counter
 	EventsBuffered        prometheus.Gauge
@@ -104,6 +107,12 @@ func New(nodeID string) *Metrics {
 			Name: "hysteria_agent_rest_heartbeats_total", Help: "REST 兜底心跳成功次数（控制通道端点不可用时）", ConstLabels: constLabels}),
 		RESTHeartbeatFailures: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "hysteria_agent_rest_heartbeat_failures_total", Help: "REST 兜底心跳失败次数", ConstLabels: constLabels}),
+		RESTConfigPolls: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "hysteria_agent_rest_config_polls_total", Help: "REST 兜底下收到新配置的次数", ConstLabels: constLabels}),
+		RESTConfigAcks: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "hysteria_agent_rest_config_acks_total", Help: "REST 兜底下成功回执的配置次数", ConstLabels: constLabels}),
+		RESTConfigFailures: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "hysteria_agent_rest_config_failures_total", Help: "REST 兜底配置轮询/回执失败次数", ConstLabels: constLabels}),
 		EventsSent: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "hysteria_agent_events_sent_total", Help: "已投递事件数", ConstLabels: constLabels}),
 		EventsResent: prometheus.NewCounter(prometheus.CounterOpts{

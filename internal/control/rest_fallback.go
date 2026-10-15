@@ -6,10 +6,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
+	"strconv"
+	"strings"
 	"time"
 
+	"github.com/getthelostcode/hysteria-agent/gen/agentpb"
 	"github.com/getthelostcode/hysteria-agent/internal/config"
 	"github.com/getthelostcode/hysteria-agent/internal/version"
 )
@@ -82,9 +86,18 @@ func (c *Client) runRESTFallback(ctx context.Context, cause error) {
 
 	// 立刻发一次，别让运维等一个心跳周期。
 	c.sendRESTHeartbeat(ctx)
+	// 配置也立刻拉一次：面板可能刚好发布过新配置
+	c.pollRESTConfig(ctx)
 
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
+
+	configEvery := time.Duration(c.cfg.Control.ConfigPollSeconds * float64(time.Second))
+	if configEvery <= 0 {
+		configEvery = 5 * time.Second
+	}
+	configTicker := time.NewTicker(configEvery)
+	defer configTicker.Stop()
 
 	for time.Now().Before(deadline) {
 		select {
@@ -92,6 +105,8 @@ func (c *Client) runRESTFallback(ctx context.Context, cause error) {
 			return
 		case <-ticker.C:
 			c.sendRESTHeartbeat(ctx)
+		case <-configTicker.C:
+			c.pollRESTConfig(ctx)
 		}
 	}
 }
@@ -182,4 +197,165 @@ func shouldFallBack(err error, cfg *config.Config) bool {
 	var he *HandshakeError
 
 	return errors.As(err, &he) && he.Unimplemented()
+}
+
+// ---------------- 配置下发（REST 兜底通道） ----------------
+
+// restConfigLatest 是控制面 GET rest_config_path 的响应。
+type restConfigLatest struct {
+	OK       bool `json:"ok"`
+	UpToDate bool `json:"up_to_date"`
+	Config   *struct {
+		Version     int    `json:"version"`
+		SHA256      string `json:"sha256"`
+		Status      string `json:"status"`
+		Revision    string `json:"revision"`
+		ContentYAML string `json:"content_yaml"`
+	} `json:"config"`
+}
+
+// pollRESTConfig 拉一次配置；有新版本就交给 agent 的应用管线（校验→原子写→热重载→失败回滚），
+// 回执由 Enqueue 走 REST 发回（见 Enqueue 里的 config_ack 分支）。
+//
+// 为什么要它：本控制面终结不了二进制 WS，配置下发只能走 REST；否则面板「发布配置」写进库
+// 就再无下文 —— 真实现场：库里所有配置都是 published、applied_at 为空。
+func (c *Client) pollRESTConfig(ctx context.Context) {
+	path := c.cfg.Control.RESTConfigPath
+	if path == "" {
+		path = "/api/v1/agent/config/latest"
+	}
+
+	c.mu.Lock()
+	current := c.restConfigVersion
+	c.mu.Unlock()
+
+	url := fmt.Sprintf("%s?current_version=%d", c.cfg.ControlHTTPURL(path), current)
+
+	reqCtx, cancel := context.WithTimeout(ctx, c.cfg.Control.ConnectTimeout())
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, url, nil)
+	if err != nil {
+		return
+	}
+	req.Header.Set("Accept", "application/json")
+	if err := c.cr.Apply(req, &c.cfg.Control); err != nil {
+		return
+	}
+	if c.cr.NodeID != "" {
+		req.Header.Set("X-Node-ID", c.cr.NodeID)
+	}
+
+	resp, err := (&http.Client{Timeout: c.cfg.Control.ConnectTimeout()}).Do(req)
+	if err != nil {
+		c.m.RESTConfigFailures.Inc()
+
+		return
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode >= 400 {
+		c.m.RESTConfigFailures.Inc()
+		c.log.Warn("REST 拉取配置被拒", "status", resp.StatusCode, "path", path)
+
+		return
+	}
+
+	var payload restConfigLatest
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		c.m.RESTConfigFailures.Inc()
+
+		return
+	}
+
+	if payload.UpToDate || payload.Config == nil || strings.TrimSpace(payload.Config.ContentYAML) == "" {
+		return
+	}
+
+	cfg := payload.Config
+	revision := cfg.Revision
+	if revision == "" {
+		revision = strconv.Itoa(cfg.Version)
+	}
+
+	c.m.RESTConfigPolls.Inc()
+	c.log.Info("REST 兜底：收到新配置", "version", cfg.Version, "revision", revision, "sha256", cfg.SHA256)
+
+	// 先记账再应用：应用失败时面板会生成更高版本的回滚配置，下一次轮询会取到它。
+	c.mu.Lock()
+	c.restConfigVersion = cfg.Version
+	c.mu.Unlock()
+
+	c.h.HandleConfigPush(ctx, &agentpb.ConfigPush{
+		Revision: revision,
+		Format:   "yaml",
+		Payload:  []byte(cfg.ContentYAML),
+		Sha256:   cfg.SHA256,
+		Reason:   "rest-fallback",
+	})
+}
+
+// sendRESTConfigAck 把配置回执通过 REST 发回控制面（兜底模式下没有 WS 可用）。
+func (c *Client) sendRESTConfigAck(ctx context.Context, ack *agentpb.ConfigAck) error {
+	path := strings.TrimSuffix(c.cfg.Control.RESTConfigPath, "/latest")
+	if path == "" || path == c.cfg.Control.RESTConfigPath {
+		path = "/api/v1/agent/config"
+	}
+
+	version, err := strconv.Atoi(strings.TrimSpace(ack.GetRevision()))
+	if err != nil || version <= 0 {
+		// 没有数字版本号（例如 revision 是 "20261015-3"）时无法回执，记一条警告即可。
+		c.log.Warn("REST 配置回执缺少数字版本号，跳过", "revision", ack.GetRevision())
+
+		return fmt.Errorf("revision %q 不是面板的版本号", ack.GetRevision())
+	}
+
+	status := "failed"
+	if ack.GetOk() {
+		status = "applied"
+	}
+
+	body, _ := json.Marshal(map[string]any{
+		"version":    version,
+		"status":     status,
+		"error":      ack.GetError(),
+		"applied_at": time.Now().UTC().Format(time.RFC3339),
+	})
+
+	reqCtx, cancel := context.WithTimeout(ctx, c.cfg.Control.ConnectTimeout())
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, c.cfg.ControlHTTPURL(path+"/ack"), bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
+	if err := c.cr.Apply(req, &c.cfg.Control); err != nil {
+		return err
+	}
+	if c.cr.NodeID != "" {
+		req.Header.Set("X-Node-ID", c.cr.NodeID)
+	}
+
+	resp, err := (&http.Client{Timeout: c.cfg.Control.ConnectTimeout()}).Do(req)
+	if err != nil {
+		c.m.RESTConfigFailures.Inc()
+
+		return err
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode >= 400 {
+		c.m.RESTConfigFailures.Inc()
+		detail, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		c.log.Warn("配置回执被拒", "status", resp.StatusCode, "url", req.URL.String(), "body", strings.TrimSpace(string(detail)))
+
+		return fmt.Errorf("配置回执被拒: HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(detail)))
+	}
+
+	c.m.RESTConfigAcks.Inc()
+	c.log.Info("REST 兜底：配置回执已送达", "version", version, "status", status, "rolled_back", ack.GetRolledBack())
+
+	return nil
 }

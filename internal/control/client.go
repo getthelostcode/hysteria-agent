@@ -103,6 +103,8 @@ type Client struct {
 	// REST 兜底：控制通道端点不可用（404/405/501，例如 Laravel 面板）时的降级状态
 	restFallback bool
 	lastSeen     time.Time
+	// restConfigVersion：兜底下最近一次取到的配置版本（面板按 int 版本号比较）
+	restConfigVersion int
 }
 
 // New 构建客户端。
@@ -182,6 +184,11 @@ func (c *Client) Enqueue(kind string, env *agentpb.Envelope) (uint64, error) {
 	env.NodeId = c.cr.NodeID
 	if env.TsMs == 0 {
 		env.TsMs = time.Now().UnixMilli()
+	}
+
+	// REST 兜底模式：配置回执没有 WS 可发，落 outbox 只会永远躺着。直接走 REST 回执。
+	if ack := env.GetConfigAck(); ack != nil && c.RESTFallbackActive() {
+		return 0, c.sendRESTConfigAck(context.Background(), ack)
 	}
 	seq, err := c.ob.Append(env, kind)
 	if err != nil {

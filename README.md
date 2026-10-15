@@ -34,6 +34,22 @@ Hysteria2 节点的**管理守护进程**：一条 WebSocket + Protobuf 长连�
 * 控制面：**本仓库自带一份可直接上线的实现**（`bin/controlplane`，见下节）；也可以自己实现，只要满足 [DESIGN.md §5.1](DESIGN.md) 的三个接口（`cmd/mockcontrol` 是 200 行的最小参考实现）
 
 
+### 配置下发也是 REST 兜底（面板「发布配置」靠它生效）
+
+控制通道 501（Laravel 终结不了二进制 WS）时，agent 不只在 REST 里发心跳，还会**轮询配置**：
+
+| 端点 | 作用 |
+| --- | --- |
+| `GET /api/v1/agent/config/latest?current_version=N` | 取最新配置（`content_yaml` + `sha256`），`up_to_date` 表示已是最新 |
+| `POST /api/v1/agent/config/ack` | 回执 `{version, status: applied\|failed, error}` |
+
+* 间隔由 `control.config_poll_seconds`（默认 5s）控制；把 `control.rest_config_path` 指到别的路径可自定义。
+* 拿到新版本走的是**同一条应用管线**：校验 → 快照 → 原子写（0600）→ 热重载 → 失败自动回滚，回执再经 REST 送回。
+* 没有这两个端点时，面板「发布配置」只会写进库（`published`），节点永远拿不到 —— 真实现场就是所有配置
+  `applied_at` 恒为空、节点上 `/etc/hysteria/config.yaml` 一动不动。
+* 回归：`PANEL_URL=http://127.0.0.1:8001 bash tests/rest_config_e2e.sh`（19 项断言：发布生效 / 面板变 applied /
+  坏配置被拒 + 自动回滚，全程真实 agent ↔ 真实 Laravel）。
+
 ### Hysteria 鉴权：默认 HTTP，已有节点可单独换
 
 静态密码（`auth.type: password`）写在节点上，用户离开平台后依然能连，也没法按流量/到期回收。
