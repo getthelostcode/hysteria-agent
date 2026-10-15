@@ -10,7 +10,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"time"
@@ -146,11 +148,17 @@ func Run(ctx context.Context, cfg *config.Config, opt Options, logf func(format 
 	switch {
 	case resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusCreated:
 	case resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden:
-		return nil, fmt.Errorf("注册被拒绝(%d)：enroll_token 无效、已使用或已过期（%s）", resp.StatusCode, snippet(body))
+		return nil, fmt.Errorf("注册被拒绝(%d)：enroll_token 无效、已使用或已过期%s", resp.StatusCode, responseHint(resp, body))
 	case resp.StatusCode == http.StatusConflict:
-		return nil, fmt.Errorf("节点已存在(%d)：如需重新注册请在控制面删除旧节点，或加 --replace（%s）", resp.StatusCode, snippet(body))
+		return nil, fmt.Errorf("节点已存在(%d)：如需重新注册请在控制面删除旧节点，或加 --replace%s", resp.StatusCode, responseHint(resp, body))
+	case resp.StatusCode == http.StatusNotFound && looksLikeHTML(body):
+		return nil, fmt.Errorf("注册失败(404)：控制面在该路径返回了 HTML 页面而不是 JSON API。\n"+
+			"  实际请求: POST %s\n"+
+			"  常见原因：① control.enroll_path 与实际路由不一致；② 该控制面还没有实现 Agent 接口\n"+
+			"  （Laravel/Rails 等框架的 404 页面长这样；本项目的接口约定见 DESIGN.md §5.1）。\n"+
+			"  自检：hysteria-agent enroll --check（会打印探测结果与提示）", enrollURL)
 	default:
-		return nil, fmt.Errorf("注册失败(%d)：%s", resp.StatusCode, snippet(body))
+		return nil, fmt.Errorf("注册失败(%d)%s", resp.StatusCode, responseHint(resp, body))
 	}
 
 	var r Response
@@ -206,6 +214,112 @@ func snippet(b []byte) string {
 	return s
 }
 
+// looksLikeHTML 判断响应体是不是网页（框架默认 404/首页），而不是 JSON API。
+func looksLikeHTML(b []byte) bool {
+	s := strings.TrimSpace(string(b))
+	if s == "" {
+		return false
+	}
+	low := strings.ToLower(s)
+	return strings.HasPrefix(low, "<!doctype") || strings.HasPrefix(low, "<html")
+}
+
+// responseHint 把"最常见的错配"直接写进错误里，省掉一轮排查。
+func responseHint(resp *http.Response, body []byte) string {
+	ct := resp.Header.Get("Content-Type")
+	switch {
+	case looksLikeHTML(body):
+		return fmt.Sprintf("：对端返回了 HTML 页面（Content-Type=%s），说明这个路径不是 JSON API——检查 enroll_path，或该控制面还没实现 Agent 接口", ct)
+	case len(body) == 0:
+		return "：响应体为空"
+	default:
+		return fmt.Sprintf("：%s", snippet(body))
+	}
+}
+
+// ProbeResult 是 --check 的探测结论。
+type ProbeResult struct {
+	URL         string
+	TLSOK       bool
+	TLSErr      error
+	StatusCode  int
+	ContentType string
+	Body        []byte
+	DialErr     error
+}
+
+// Hint 给出针对当前探测结果的处置建议（可直接照做）。
+func (p *ProbeResult) Hint() string {
+	switch {
+	case p.StatusCode == 0 && p.DialErr != nil:
+		return "连不上控制面：确认域名可解析、端口可达（https 默认 443）、防火墙/Cloudflare 隧道是否放行。"
+	case p.StatusCode == 0:
+		return "请求已发出但没有拿到响应：检查是否被中间件截断。"
+	case p.StatusCode == http.StatusUnauthorized || p.StatusCode == http.StatusForbidden:
+		return "路径正确、但认证被拒：enroll_token 无效/已使用/已过期。"
+	case p.StatusCode == http.StatusMethodNotAllowed:
+		return "该路径不接受 POST（本项目 Agent 用 POST 注册）。"
+	case p.StatusCode == http.StatusNotFound && looksLikeHTML(p.Body):
+		return "对端在该路径返回网页 404：① control.enroll_path 与实际路由不一致；② 控制面尚未实现 Agent 接口（Laravel/Rails 的默认 404 页正是这种）。需要控制面提供 POST " + p.URL + "。"
+	case p.StatusCode == http.StatusNotFound:
+		return "404：路径不对。核对控制面 enroll 路由的完整路径，必要时改 control.enroll_path。"
+	case p.StatusCode >= 500:
+		return "控制面 5xx：对端内部错误，查控制面日志。"
+	case p.StatusCode == http.StatusOK || p.StatusCode == http.StatusCreated:
+		if looksLikeHTML(p.Body) {
+			return "2xx 但返回网页：命中了站点前端路由，不是 Agent API。"
+		}
+		return "路径可达且返回 2xx：若正式注册仍失败，多为令牌/节点名等业务校验。"
+	default:
+		return fmt.Sprintf("HTTP %d，请对照控制面日志排查。", p.StatusCode)
+	}
+}
+
+// ProbeHTTP 对 enroll 端点发一次真实请求（占位 token，不泄露真令牌），
+// 让"路径是否存在、是不是 JSON API"变得可判定。
+func ProbeHTTP(ctx context.Context, cfg *config.Config) *ProbeResult {
+	res := &ProbeResult{URL: cfg.ControlHTTPURL(cfg.Control.EnrollPath)}
+	empty := &creds.Credentials{}
+	tlsCfg, err := empty.TLSConfig(&cfg.Control, nil)
+	if err != nil {
+		res.TLSErr = err
+		res.DialErr = err
+		return res
+	}
+	if tlsCfg.InsecureSkipVerify && len(cfg.Control.PinSHA256) == 0 {
+		tlsCfg.InsecureSkipVerify = false
+	}
+	res.TLSOK = true
+	client := &http.Client{
+		Timeout:   15 * time.Second,
+		Transport: &http.Transport{TLSClientConfig: tlsCfg, Proxy: http.ProxyFromEnvironment},
+	}
+	payload, _ := json.Marshal(Request{
+		EnrollToken:  "probe-token-not-real",
+		NodeName:     "probe",
+		Hostname:     "probe",
+		AgentVersion: version.Version,
+	})
+	req, rerr := http.NewRequestWithContext(ctx, http.MethodPost, res.URL, bytes.NewReader(payload))
+	if rerr != nil {
+		res.DialErr = rerr
+		return res
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Agent-Version", version.Version)
+	resp, derr := client.Do(req)
+	if derr != nil {
+		res.DialErr = derr
+		res.TLSOK = false
+		return res
+	}
+	defer resp.Body.Close()
+	res.StatusCode = resp.StatusCode
+	res.ContentType = resp.Header.Get("Content-Type")
+	res.Body, _ = io.ReadAll(io.LimitReader(resp.Body, 4096))
+	return res
+}
+
 func orDefault(v, def string) string {
 	if strings.TrimSpace(v) == "" {
 		return def
@@ -223,12 +337,41 @@ func PingTLS(ctx context.Context, cfg *config.Config) error {
 	if tlsCfg.InsecureSkipVerify && len(cfg.Control.PinSHA256) == 0 {
 		tlsCfg.InsecureSkipVerify = false // 探测时不要真的跳过校验
 	}
-	host := strings.TrimPrefix(strings.TrimPrefix(cfg.Control.ServerURL, "https://"), "http://")
-	host = strings.TrimSuffix(host, "/")
-	d := &tls.Dialer{Config: tlsCfg, NetDialer: nil}
-	conn, err := d.DialContext(ctx, "tcp", host)
+	addr, err := controlAddr(cfg.Control.ServerURL)
+	if err != nil {
+		return err
+	}
+	d := &tls.Dialer{Config: tlsCfg}
+	conn, err := d.DialContext(ctx, "tcp", addr)
 	if err != nil {
 		return err
 	}
 	return conn.Close()
+}
+
+// controlAddr 从控制面地址解析出可直接拨号的 "host:port"。
+//
+// 之前的实现直接拿 "node.ipx.sarl" 去 Dial，会得到
+// `dial tcp: address node.ipx.sarl: missing port in address`——
+// 没有端口的 URL 必须补默认端口（https/wss→443，http/ws→80），
+// 同时要丢掉 path/query 并正确处理 IPv6 字面量。
+func controlAddr(raw string) (string, error) {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return "", fmt.Errorf("control.server_url 无法解析: %w", err)
+	}
+	host := u.Hostname()
+	if host == "" {
+		return "", fmt.Errorf("control.server_url 里没有主机名: %q", raw)
+	}
+	port := u.Port()
+	if port == "" {
+		switch strings.ToLower(u.Scheme) {
+		case "http", "ws":
+			port = "80"
+		default:
+			port = "443"
+		}
+	}
+	return net.JoinHostPort(host, port), nil
 }

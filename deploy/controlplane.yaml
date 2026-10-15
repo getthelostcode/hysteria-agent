@@ -1,0 +1,57 @@
+# 控制面配置模板（hysteria-agent 的 Control Plane）
+#
+# 复制到 /etc/hysteria-controlplane/config.yaml 并 chmod 0600。
+# 最快的方式是让程序自己生成（会填好随机 admin_token 与主密钥）：
+#   controlplane init -config /etc/hysteria-controlplane/config.yaml
+#
+# 注意：admin_token 与 master_key 都是机密，务必 0600 且只 root 可读。
+
+# 监听地址。放在 Cloudflare Tunnel / nginx 后面时保持 127.0.0.1，由隧道暴露域名。
+listen: "127.0.0.1:8443"
+
+# 状态目录：state.json（节点/令牌/待确认配置）+ events/<node>.jsonl（事件归档）+ master.key
+state_dir: "/var/lib/hysteria-controlplane"
+
+# 运维接口令牌（/admin/*）。留空会拒绝启动（避免无鉴权的管理面）。
+admin_token: ""
+
+# 主密钥（hex，>=32 字节）。node_secret 由它按 node_id 派生，因此控制面不需要保存任何共享密钥；
+# 删除节点记录即等于立即吊销。留空则首次启动在 state_dir/master.key 生成（0600），
+# 也可以显式写在这里以便随其他配置一起备份。
+master_key: ""
+
+# 下发给 Agent 的控制面地址（写对外域名；Agent 会把它存进 credentials.json）
+public_url: "https://node.ipx.sarl"
+
+# 面向 Agent 的路径（改这里的话，cloudflared/nginx 的路径路由要同步）
+enroll_path: "/api/v1/agent/enroll"
+ws_path: "/api/v1/agent/control"
+
+# 控制面自身监听的 TLS。直接对外暴露时填；在隧道/反代后面留空即可。
+tls:
+  cert_file: ""
+  key_file: ""
+
+# 心跳/遥测协商值：Agent 连上后会按这里的值工作（HelloAck 里下发）
+heartbeat:
+  interval_seconds: 30      # 心跳间隔
+  timeout_seconds: 90       # 超过这个时间没心跳判离线（心跳 × 3 比较稳）
+  telemetry_seconds: 15     # 遥测间隔
+
+# 可选：要求 Agent 做证书 pinning（对端证书链中任意一张的 SPKI-SHA256，base64）
+# 生成方式：openssl s_client -connect node.ipx.sarl:443 -servername node.ipx.sarl </dev/null 2>/dev/null \
+#            | openssl x509 -pubkey -noout | openssl pkey -pubin -outform der \
+#            | openssl dgst -sha256 -binary | openssl base64
+pin_sha256: []
+# 可选：下发给 Agent 的私有 CA（PEM 文本），用于自签证书场景
+ca_cert_pem: ""
+
+# debug | info | warn | error
+log_level: "info"
+
+# 每个节点事件日志保留的最大条数（超出后只保留最新 N 条）
+retention:
+  max_events_per_node: 20000
+
+# 是否提供只读仪表盘（GET /）。false 可关闭（省掉一个页面，不影响 API）。
+dashboard: true

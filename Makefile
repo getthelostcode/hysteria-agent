@@ -34,13 +34,14 @@ ifneq ($(UPGRADE_PUBKEY),)
 LDFLAGS += -X $(MODULE)/internal/version.UpgradePublicKey=$(UPGRADE_PUBKEY)
 endif
 
-.PHONY: all build tools proto test vet e2e dist release clean install smoke-release
+.PHONY: all build tools proto test vet e2e dist release clean install smoke-release smoke-cp
 
 all: build tools
 
 build:
 	mkdir -p bin
 	$(GO) build -trimpath -ldflags '$(LDFLAGS)' -o bin/$(BIN) ./cmd/hysteria-agent
+	$(GO) build -trimpath -ldflags '$(LDFLAGS)' -o bin/controlplane ./cmd/controlplane
 	@echo "--- 版本信息 ---"
 	@./bin/$(BIN) version
 	@if [ -z "$(UPGRADE_PUBKEY)" ]; then \
@@ -94,8 +95,12 @@ release:
 	  CGO_ENABLED=0 GOOS=linux GOARCH=$$arch $(GO) build -trimpath -o $$dir/bin/mockcontrol ./cmd/mockcontrol || exit 1; \
 	  CGO_ENABLED=0 GOOS=linux GOARCH=$$arch $(GO) build -trimpath -o $$dir/bin/mockhysteria ./cmd/mockhysteria || exit 1; \
 	  CGO_ENABLED=0 GOOS=linux GOARCH=$$arch $(GO) build -trimpath -o $$dir/bin/agent-sign ./cmd/agent-sign || exit 1; \
+	  CGO_ENABLED=0 GOOS=linux GOARCH=$$arch $(GO) build -trimpath \
+	    -ldflags '$(LDFLAGS) -X $(MODULE)/internal/version.Version=$(VERSION)' \
+	    -o $$dir/bin/controlplane ./cmd/controlplane || exit 1; \
 	  cp install.sh $$dir/install.sh; \
-	  mkdir -p $$dir/deploy; cp deploy/config.yaml deploy/hysteria-agent.service $$dir/deploy/; \
+	  mkdir -p $$dir/deploy; cp deploy/config.yaml deploy/hysteria-agent.service \
+	    deploy/controlplane.yaml deploy/controlplane.service $$dir/deploy/ 2>/dev/null || true; \
 	  cp README.md DESIGN.md $$dir/; \
 	  ( cd $$dir && sha256sum bin/* > SHA256SUMS ); \
 	  tar -czf $(RELEASE)/$$name.tar.gz -C $(RELEASE) $$name; \
@@ -111,6 +116,10 @@ release:
 # smoke-release：用发布包里的二进制真跑一遍（enroll → 长连接 → /readyz 200）
 smoke-release:
 	bash tests/smoke_release.sh
+
+# smoke-cp：控制面端到端（init → serve → enroll → 下发配置 → 指令 → 事件 → 优雅停止）
+smoke-cp: build
+	bash tests/controlplane_smoke.sh
 
 clean:
 	rm -rf bin $(DIST)

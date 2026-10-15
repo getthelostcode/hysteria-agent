@@ -289,6 +289,21 @@ CommandRequest{tail_logs, params:{duration_seconds≤300, backlog_lines, source,
 | GET | `/api/v1/agent/control` | WebSocket 升级请求，头：`Authorization: Bearer <JWT>`、`X-Node-ID`、`X-Agent-Version`、`X-Agent-Protocol` | WebSocket（二进制帧 = Envelope） |
 | GET | `/api/v1/agent/token` | 可选：Agent 自检用（未实现则允许 404） | 任意 |
 
+#### 本仓库自带的实现（`cmd/controlplane` + `internal/cp`）
+
+不必自己写控制面：上面三个接口有完整实现，`install-controlplane.sh` 一把装好（二进制 + 0600 配置 + systemd + 现场验证）。
+
+* **进程内状态**：`state_dir/state.json`（0600）= 节点表 + 注册令牌 + 待确认配置；`state_dir/events/<node>.jsonl`（0600，追加式）= 事件归档（node_event / command_result / config_ack / conn），按 `retention.max_events_per_node` 裁剪。
+* **不保存共享密钥**：`node_secret = HMAC-SHA256(master_key, "node_secret:"+node_id)`（HKDF 的 HMAC 简化式，标准库即可复算）。控制面只存 `node_id`，因此**删除节点记录 = 立刻吊销**，也不会因为"数据库被读"而泄露所有节点的长期密钥；`master_key` 存 `state_dir/master.key`（0600）或配置的 `master_key`。
+* **令牌**：`controlplane token new --name x [--ttl 24h] [--max-uses 1]`，一次性令牌用满即失效；`token list` 只返回掩码；吊销用 `DELETE /admin/tokens/{token}`（需要完整令牌）。
+* **幂等**：会话内按 seq 去重，跨连接再与持久化的 `acked_seq` 比对；重复消息只累加 `duplicate_msgs`，但**仍然回 `EventAck`**，否则 Agent 的 outbox 水位线会卡住（这是 E2E 里真实踩到的坑）。
+* **配置下发的确认链**：`ConfigPush(revision, sha256, dry_run)` → `ConfigAck`；`pending` 记录会按 revision 重发（30s/次，最多 20 次），节点重连后自动补发，`ConfigAck.ok=false` 或 `rolled_back` 时清 pending 并记 `config_state=failed|rolled_back`。
+* **离线判定**：`heartbeat.timeout_seconds`（默认 90s）无心跳则标 `connected=false` 并写一条 `conn/timeout` 事件；同时把 `HelloAck` 的心跳/遥测间隔下发，Agent 收到后**立刻**按新间隔重排（不是等下一次重连）。
+* **管理接口**（`Authorization: Bearer <admin_token>`）：`/admin/nodes`、`/admin/nodes/{id}`、`POST /admin/nodes/{id}/config`（body 直接放配置正文，`?reason=&revision=&dry_run=&wait=`）、`POST /admin/nodes/{id}/commands?type=&wait=`、`GET /admin/nodes/{id}/events?limit=`、`GET /admin/nodes/{id}/telemetry`、`POST /admin/tokens`、`DELETE /admin/nodes/{id}`。CLI（`controlplane nodes|node|push-config|command|events|telemetry|delete-node`）就是这套接口的薄封装。
+* **指标**：`/metrics` 暴露 `cp_nodes_total{status}`、`cp_enroll_total{result}`、`cp_control_ws_total{result}`、`cp_messages_total{kind}`、`cp_commands_total{stage}`、`cp_config_push_total{result}`，以及每节点的 `cp_node_last_seen_seconds` / `cp_node_cpu_percent` 等。
+* **只读仪表盘**：`GET /`（可用 `dashboard: false` 关闭）。令牌存在浏览器 localStorage，服务端不下发 cookie。
+* **部署拓扑**：控制面默认只监听 `127.0.0.1:8443`，对外由 cloudflared（带 `path` 的 ingress 规则，可与面板站点同域共存）或 nginx（转发 `Upgrade`/`Connection`，`proxy_read_timeout 3600s`）反代。若控制面自己是 Laravel/PHP 这类无法保持长连接的栈，就让 Go 控制面只接管 `/api/v1/agent/*`，面板继续做 UI，二者通过 `/admin/*` 对接。
+
 ### 5.2 指令参数与结果
 
 | 指令 | params（JSON） | result（JSON） |

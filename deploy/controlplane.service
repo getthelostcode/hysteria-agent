@@ -1,0 +1,31 @@
+[Unit]
+Description=Hysteria Agent Control Plane
+Documentation=https://github.com/getthelostcode/hysteria-agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# 需要一个非 root 用户时改成下面这样（并事先 chown state_dir）：
+# User=hysteria-cp
+# Group=hysteria-cp
+ExecStart=/usr/local/bin/controlplane serve -config /etc/hysteria-controlplane/config.yaml
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=always
+RestartSec=2s
+
+# 配置里有 admin_token 与 master_key，不让它落到日志/内存转储里
+Environment=GOTRACEBACK=none
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/hysteria-controlplane
+
+# 日志走 journald（结构化 JSON 输出）
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=controlplane
+
+[Install]
+WantedBy=multi-user.target

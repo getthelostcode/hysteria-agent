@@ -31,7 +31,70 @@ Hysteria2 节点的**管理守护进程**：一条 WebSocket + Protobuf 长连�
 
 * 节点机：Linux（systemd 推荐）；root 或等价权限
 * Hysteria 2 服务端（Agent 可以代为安装/守护，也可以只管已有的实例）
-* 控制面：实现 [DESIGN.md §5.1](DESIGN.md) 的三个接口即可（Go / Python / PHP 都行；`cmd/mockcontrol` 是一份 200 行的参考实现）
+* 控制面：**本仓库自带一份可直接上线的实现**（`bin/controlplane`，见下节）；也可以自己实现，只要满足 [DESIGN.md §5.1](DESIGN.md) 的三个接口（`cmd/mockcontrol` 是 200 行的最小参考实现）
+
+## 控制面（内置，开箱可用）
+
+控制面不需要你自己写：`cmd/controlplane` 是完整实现——节点注册、控制通道、配置下发、指令下发、事件归档、指标、只读仪表盘。
+
+```bash
+# 在控制面那台机器上（仓库根目录）
+bash install-controlplane.sh --public-url https://cp.example.com
+#   → 装二进制 + 生成 0600 配置（随机 admin_token 与主密钥）+ systemd 起服务 + 现场验证
+#   → 输出 admin_token（只显示这一次，请保存）
+
+controlplane token new --name hk-node-1     # 生成一次性注册令牌
+controlplane nodes                          # 节点列表（在线/离线/配置状态/遥测）
+controlplane node <node_id>                 # 单节点详情
+controlplane push-config <node_id> /etc/hysteria/config.yaml --reason "调 masquerade" --wait 25s
+controlplane command <node_id> run_diagnostic
+controlplane events <node_id> --limit 50
+controlplane delete-node <node_id>          # 吊销（node_secret 由主密钥派生，删记录即失效）
+```
+
+对外只需要暴露两个路径（WebSocket 要转发 `Upgrade`/`Connection` 头）：
+
+| 路径 | 说明 |
+|---|---|
+| `POST /api/v1/agent/enroll` | 注册（一次性令牌 → `node_id` + `node_secret`） |
+| `GET /api/v1/agent/control` | 控制通道（WebSocket，`Authorization: Bearer <本机自签 JWT>`） |
+
+Cloudflare Tunnel（控制面在隧道后面时，`cloudflared` 的 ingress 支持按 path 匹配，可与已有站点共存）：
+
+```yaml
+# ~/.cloudflared/config.yml
+tunnel: <tunnel-id>
+credentials-file: /root/.cloudflared/<tunnel-id>.json
+ingress:
+  - hostname: node.ipx.sarl
+    path: /api/v1/agent/.*
+    service: http://127.0.0.1:8443      # 控制面（WS 走同一路径，cloudflared 自动转发 Upgrade）
+  - hostname: node.ipx.sarl
+    service: http://127.0.0.1:8080      # 你原有的面板/站点
+  - service: http_status:404
+```
+
+nginx 反代（等价写法）：
+
+```nginx
+location ~ ^/api/v1/agent/ {
+    proxy_pass http://127.0.0.1:8443;
+    proxy_http_version 1.1;
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection "upgrade";
+    proxy_read_timeout 3600s;           # 控制通道是长连接
+    proxy_set_header X-Node-ID $http_x_node_id;
+}
+```
+
+管理侧接口（`Authorization: Bearer <admin_token>`）：`GET /admin/nodes`、`GET /admin/nodes/{id}`、`POST /admin/nodes/{id}/config`、`POST /admin/nodes/{id}/commands?type=…`、`GET /admin/nodes/{id}/events`、`GET /admin/nodes/{id}/telemetry`、`POST /admin/tokens`、`DELETE /admin/nodes/{id}`、`DELETE /admin/tokens/{token}`。浏览器打开 `/` 是只读仪表盘（令牌存 localStorage，不发 cookie）。
+
+设计要点（安全与幂等）：
+
+* **不保存共享密钥**：`node_secret = HMAC-SHA256(master_key, "node_secret:"+node_id)`，控制面只存 `node_id`；删除节点记录 = 立即吊销。`master_key` 在 `state_dir/master.key`（0600）或配置里。
+* **投递 at-least-once + 幂等**：按 `(node_id, seq)` 去重（跨连接也比对持久化的 `acked_seq`），重复消息只计数不重复入库，但仍回 `EventAck` 让 Agent 的 outbox 前进。
+* **配置下发的确认链**：`ConfigPush(revision, sha256)` → `ConfigAck`；控制面按 revision 幂等重发（30s 一次，最多 20 次），上线后若仍有未确认下发会自动补发。
+* 状态全在 `state_dir`：`state.json`（0600，节点/令牌/待确认配置）+ `events/<node>.jsonl`（0600，按上限裁剪）。
 
 ## 快速开始
 
@@ -57,7 +120,7 @@ bash install.sh https://cp.example.com --token=<enroll_token> --name=hk-node-1
 curl -s 127.0.0.1:9100/healthz && curl -s 127.0.0.1:9100/readyz
 ```
 
-包内包含：`bin/{hysteria-agent,mockcontrol,mockhysteria,agent-sign}`（全部静态链接，`CGO_ENABLED=0`）、
+包内包含：`bin/{hysteria-agent,controlplane,mockcontrol,mockhysteria,agent-sign}`（全部静态链接，`CGO_ENABLED=0`）、
 `install.sh`、`deploy/{config.yaml,hysteria-agent.service}`、`README.md`、`DESIGN.md`。
 
 需要自己重新构建发布包时：
@@ -284,9 +347,15 @@ signature  = base64(ed25519_sign(private_key, sha256_hex))     # 对哈希的 he
 
 | 现象 | 定位 | 处理 |
 |---|---|---|
+| `TLS 预检失败: dial tcp: address cp.example.com: missing port in address` | 老版本没有给无端口的 URL 补默认端口（已修） | 升级到当前版本；或把地址写成 `https://cp.example.com:443` |
+| `注册失败(404)：<!DOCTYPE html>…` | 打到了网页而不是 API：路径不对，或控制面还没实现 Agent 接口（Laravel/Rails 的默认 404 页正是这种） | 先自检：`hysteria-agent enroll --check`（会打印实际 URL、HTTP 状态、Content-Type 和结论）；确认对端有 `POST /api/v1/agent/enroll`；用本仓库的 `install-controlplane.sh` 起控制面并按 README「控制面」一节配路径路由 |
+| `注册失败(401)：未知的 enroll_token` | 令牌写错 / 已用过（一次性）/ 已过期 / 被吊销 | `controlplane token list` 看用量，重新 `token new` |
+| `enroll --check` 里 TLS 通过但 WS 连不上 | 反代没有转发 WebSocket | nginx 加 `Upgrade`/`Connection` + `proxy_read_timeout 3600s`；cloudflared 用带 path 的 ingress 规则 |
 | 启动即退出：`control.server_url 使用明文` | 用了 `http://` | 生产用 `https://`；联调加 `control.allow_insecure_ws: true` |
 | 启动即退出：`没有可用验签公钥` | `upgrade.enabled: true` 但没配公钥 | `upgrade.enabled: false` 或填 `upgrade.pubkeys` |
-| `JWT 校验失败` / WS 握手 401 | 控制面侧 `node_secret` 与本地不一致，或时钟偏差过大 | 对比 `credentials.json`、查 `diag` 的时钟检查、同步 NTP |
+| `JWT 校验失败` / WS 握手 401 | 控制面侧 `node_secret` 与本地不一致，或时钟偏差过大 | 对比 `credentials.json`、查 `diag` 的时钟检查、同步 NTP；控制面换了 `master_key` 会导致所有节点必须重新注册 |
+| 控制面 `/admin/nodes` 返回 401 | 令牌不对 | 用配置文件里的 `admin_token`，或 `--token` 指定 |
+| 心跳迟迟不到（`uptime=0`） | 老版本里 HelloAck 协商的心跳间隔要等下一次重连才生效（已修） | 升级 Agent |
 | `证书 pinning 校验失败：…SPKI pin = …` | 控制面证书换了或 pin 配错 | 用报错里的实际 pin 更新 `control.pin_sha256` 或注册响应 |
 | 连接一直重连（`control_reconnects_total` 涨） | 网络/隧道/控制面不可用 | 看 `diag` 的 `control_plane` 检查，确认 `X-Node-ID` 与 JWT 一致 |
 | 配置下发被拒：`trafficStats.secret 与 Agent 的 hysteria.api_secret 不一致` | Hysteria 配置里的 secret 与 Agent 配置不一致 | 改一处即可（改 Hysteria 配置要重启 Hysteria） |
@@ -305,6 +374,7 @@ signature  = base64(ed25519_sign(private_key, sha256_hex))     # 对哈希的 he
 .
 ├── cmd/
 │   ├── hysteria-agent/     # 主程序（CLI：enroll/run/status/restart/upgrade/diag/config/version）
+│   ├── controlplane/       # 控制面：注册/控制通道/配置下发/指令下发/事件归档 + CLI + 只读仪表盘
 │   ├── agent-sign/         # 控制面侧升级签名工具（keygen/sign/pubkey）
 │   ├── mockcontrol/        # 假控制面（协议第二实现 + E2E 驱动接口）
 │   └── mockhysteria/       # 假 Hysteria2（监听端口 + /traffic /online /kick + 毒配置）

@@ -110,6 +110,17 @@ func New(cfg *config.Config, cr *creds.Credentials, log *slog.Logger, m *metrics
 }
 
 // TelemetryInterval 返回控制面协商后的遥测间隔。
+// heartbeatDuration 返回当前生效的心跳间隔（带下限保护，避免被对端设成 0 导致忙循环）。
+func (c *Client) heartbeatDuration() time.Duration {
+	c.mu.Lock()
+	d := c.heartbeatEvery
+	c.mu.Unlock()
+	if d < time.Second {
+		d = 30 * time.Second
+	}
+	return d
+}
+
 func (c *Client) TelemetryInterval() time.Duration {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -273,6 +284,7 @@ type session struct {
 	done          chan struct{}
 	once          sync.Once
 	notify        chan struct{}
+	hbChanged     chan struct{} // HelloAck 改了心跳间隔时用来立刻重排定时器
 	lastServerMsg time.Time
 }
 
@@ -281,6 +293,14 @@ func (s *session) close() { s.once.Do(func() { close(s.done) }) }
 func (s *session) nudge() {
 	select {
 	case s.notify <- struct{}{}:
+	default:
+	}
+}
+
+// nudgeHeartbeat 让写循环用新的心跳间隔立刻重排（HelloAck 协商后会调用）。
+func (s *session) nudgeHeartbeat() {
+	select {
+	case s.hbChanged <- struct{}{}:
 	default:
 	}
 }
@@ -334,7 +354,8 @@ func (c *Client) session(ctx context.Context) error {
 	defer conn.Close()
 	conn.SetReadLimit(c.cfg.Control.MaxMessageBytes)
 
-	s := &session{c: c, conn: conn, done: make(chan struct{}), notify: make(chan struct{}, 1), lastServerMsg: time.Now()}
+	s := &session{c: c, conn: conn, done: make(chan struct{}), notify: make(chan struct{}, 1),
+		hbChanged: make(chan struct{}, 1), lastServerMsg: time.Now()}
 
 	// ctx 结束或会话被关闭时立刻断开底层连接。
 	// 少了这一步：读循环会卡在 ReadMessage 里直到读超时（默认 90s），
@@ -388,7 +409,9 @@ func (c *Client) session(ctx context.Context) error {
 
 	// 2) 写循环：心跳 + 补发 + 实时消息
 	go func() {
-		heartbeat := time.NewTicker(c.heartbeatEvery)
+		// 用 Timer 而不是 Ticker：HelloAck 可以把心跳间隔改小（例如 30s→5s），
+		// 用 Ticker 的话新间隔要等到下一次重连才生效。
+		heartbeat := time.NewTimer(c.heartbeatDuration())
 		defer heartbeat.Stop()
 		flush := time.NewTicker(time.Second)
 		defer flush.Stop()
@@ -405,6 +428,15 @@ func (c *Client) session(ctx context.Context) error {
 					s.close()
 					return
 				}
+				heartbeat.Reset(c.heartbeatDuration())
+			case <-s.hbChanged:
+				if !heartbeat.Stop() {
+					select {
+					case <-heartbeat.C:
+					default:
+					}
+				}
+				heartbeat.Reset(c.heartbeatDuration())
 			case <-flush.C:
 				if err := s.flushPending(); err != nil {
 					c.log.Warn("补发事件失败", slog.String("error", err.Error()))
@@ -560,7 +592,7 @@ func (c *Client) dispatch(ctx context.Context, s *session, env *agentpb.Envelope
 	switch b := env.GetBody().(type) {
 	case *agentpb.Envelope_HelloAck:
 		ack := b.HelloAck
-		c.applyHelloAck(ack)
+		c.applyHelloAck(ack, s)
 		c.log.Info("握手完成",
 			slog.String("server_version", ack.GetServerVersion()),
 			slog.String("server_config_revision", ack.GetConfigRevision()),
@@ -636,11 +668,14 @@ func (c *Client) safeHandle(name string, ctx context.Context, fn func(context.Co
 	fn(ctx)
 }
 
-func (c *Client) applyHelloAck(ack *agentpb.HelloAck) {
+func (c *Client) applyHelloAck(ack *agentpb.HelloAck, s *session) {
 	c.mu.Lock()
-	defer c.mu.Unlock()
+	changed := false
 	if v := ack.GetHeartbeatIntervalSeconds(); v >= 5 {
-		c.heartbeatEvery = time.Duration(v) * time.Second
+		if d := time.Duration(v) * time.Second; d != c.heartbeatEvery {
+			c.heartbeatEvery = d
+			changed = true
+		}
 	}
 	if v := ack.GetTelemetryIntervalSeconds(); v >= 1 {
 		c.telemetryEvery = time.Duration(v) * time.Second
@@ -650,6 +685,11 @@ func (c *Client) applyHelloAck(ack *agentpb.HelloAck) {
 	}
 	if r := ack.GetConfigRevision(); r != "" {
 		c.serverRevision = r
+	}
+	c.mu.Unlock()
+	if changed && s != nil {
+		// 立刻按新间隔重排心跳定时器（否则要等到下一次重连才生效）
+		s.nudgeHeartbeat()
 	}
 }
 

@@ -230,12 +230,38 @@ func cmdEnroll(argv []string) int {
 	logf := func(format string, a ...any) { fmt.Printf(format+"\n", a...) }
 
 	// 预检：TLS/pin 配错的问题在这里暴露，而不是等注册失败。
+	logf("控制面地址: %s", cfg.Control.ServerURL)
+	logf("注册端点  : %s", cfg.ControlHTTPURL(cfg.Control.EnrollPath))
 	if err := enroll.PingTLS(ctx, cfg); err != nil {
 		fmt.Fprintf(os.Stderr, "[WARN] TLS 预检失败（可能是控制面在隧道后面或证书 pin 不匹配）: %v\n", err)
 	} else {
 		logf("TLS 预检通过（含证书链与 pin 校验）")
 	}
 	if *checkOnly {
+		// 再发一次真实请求（占位 token）：判定"路径到底存不存在、是不是 JSON API"，
+		// 这类错配（尤其是框架默认的 HTML 404）光看 TLS 预检是看不出来的。
+		probe := enroll.ProbeHTTP(ctx, cfg)
+		logf("")
+		logf("HTTP 探测结果：")
+		logf("  URL          : %s", probe.URL)
+		if probe.TLSErr != nil {
+			logf("  TLS          : 失败 (%v)", probe.TLSErr)
+		} else if probe.TLSOK {
+			logf("  TLS          : 通过")
+		} else {
+			logf("  TLS          : 失败 (%v)", probe.DialErr)
+		}
+		if probe.DialErr != nil && probe.StatusCode == 0 {
+			logf("  传输         : 失败 (%v)", probe.DialErr)
+		} else {
+			logf("  HTTP 状态    : %d", probe.StatusCode)
+			logf("  Content-Type : %s", probe.ContentType)
+			if len(probe.Body) > 0 {
+				logf("  响应片段     : %s", firstLine(probe.Body))
+			}
+		}
+		logf("  结论         : %s", probe.Hint())
+		logf("")
 		logf("预检完成（--check 模式，未注册）")
 		return 0
 	}
@@ -687,6 +713,18 @@ func buildHTTPClient(cfg *config.Config, cr *creds.Credentials) (*http.Client, e
 			TLSHandshakeTimeout: cfg.Control.ConnectTimeout(),
 		},
 	}, nil
+}
+
+// firstLine 取响应体的第一行（探测输出用，避免把整页 HTML 打印出来）。
+func firstLine(b []byte) string {
+	s := strings.TrimSpace(string(b))
+	if i := strings.IndexByte(s, '\n'); i >= 0 {
+		s = s[:i]
+	}
+	if len(s) > 160 {
+		s = s[:160] + "..."
+	}
+	return s
 }
 
 func simpleLogger() *slog.Logger {
