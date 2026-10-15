@@ -18,6 +18,8 @@ import (
 	"github.com/getthelostcode/hysteria-agent/internal/config"
 	"github.com/getthelostcode/hysteria-agent/internal/creds"
 	"github.com/getthelostcode/hysteria-agent/internal/version"
+
+	"gopkg.in/yaml.v3"
 )
 
 // REST 心跳兜底。
@@ -45,6 +47,57 @@ type restHeartbeatBody struct {
 	Degraded        bool    `json:"degraded"`
 	SentAtMs        int64   `json:"sent_at_ms"`
 	Uptime          float64 `json:"uptime,omitempty"`
+
+	// 节点现状：面板渲染配置时应当照抄这些值，而不是写死。
+	// 面板写死一个节点上不存在的证书路径、或与 agent 的 hysteria.api_secret 不一致的
+	// trafficStats.secret 时，agent 会**整份拒收**配置（jp8 连发四版全 failed），
+	// 而面板上完全看不出原因。
+	CertPath           string `json:"cert_path,omitempty"`
+	KeyPath            string `json:"key_path,omitempty"`
+	TrafficStatsListen string `json:"traffic_stats_listen,omitempty"`
+	TrafficStatsSecret string `json:"traffic_stats_secret,omitempty"`
+}
+
+// hysteriaShape 是节点当前 hysteria 配置里「面板需要照抄」的那几项。
+type hysteriaShape struct {
+	CertPath    string
+	KeyPath     string
+	StatsListen string
+	StatsSecret string
+}
+
+// readHysteriaShape 读一次节点的 hysteria 配置（只取几个字段，读不到就返回空值）。
+func readHysteriaShape(path string) hysteriaShape {
+	if path == "" {
+		return hysteriaShape{}
+	}
+
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return hysteriaShape{}
+	}
+
+	var doc struct {
+		TLS struct {
+			Cert string `yaml:"cert"`
+			Key  string `yaml:"key"`
+		} `yaml:"tls"`
+		TrafficStats struct {
+			Listen string `yaml:"listen"`
+			Secret string `yaml:"secret"`
+		} `yaml:"trafficStats"`
+	}
+
+	if err := yaml.Unmarshal(raw, &doc); err != nil {
+		return hysteriaShape{}
+	}
+
+	return hysteriaShape{
+		CertPath:    strings.TrimSpace(doc.TLS.Cert),
+		KeyPath:     strings.TrimSpace(doc.TLS.Key),
+		StatsListen: strings.TrimSpace(doc.TrafficStats.Listen),
+		StatsSecret: strings.TrimSpace(doc.TrafficStats.Secret),
+	}
 }
 
 // RESTFallbackActive 报告当前是否处于 REST 兜底模式（CLI status 用）。
@@ -199,6 +252,21 @@ func (c *Client) sendRESTHeartbeat(ctx context.Context) {
 		Degraded:        true,
 		SentAtMs:        time.Now().UnixMilli(),
 	}
+
+	// 面板照抄节点现状：证书路径 + trafficStats（secret 用配置里的，没有才回退到 agent 自己的）
+	shape := readHysteriaShape(c.cfg.Hysteria.ConfigPath)
+	body.CertPath = shape.CertPath
+	body.KeyPath = shape.KeyPath
+	body.TrafficStatsListen = shape.StatsListen
+	body.TrafficStatsSecret = shape.StatsSecret
+	if body.TrafficStatsSecret == "" {
+		body.TrafficStatsSecret = c.cfg.Hysteria.APISecret
+	}
+	if body.TrafficStatsListen == "" {
+		body.TrafficStatsListen = strings.TrimPrefix(strings.TrimPrefix(c.cfg.Hysteria.APIBaseURL, "http://"), "https://")
+	}
+
+	_ = struct{}{}
 
 	if c.cr != nil {
 		body.NodeID = c.cr.NodeID

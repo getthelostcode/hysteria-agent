@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -44,11 +45,15 @@ func (h *blockHandler) HandleUpgradeOffer(context.Context, *agentpb.UpgradeOffer
 // 回归：配置应用慢/卡住时，心跳必须照常上报（真实现场：面板「最后心跳不更新」）。
 func TestRESTFallbackHeartbeatIsIndependentOfConfigApply(t *testing.T) {
 	var heartbeats atomic.Int64
+	var lastBody atomic.Value // 最近一次心跳的正文（JSON）
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case r.URL.Path == "/api/v1/agent/heartbeat":
 			heartbeats.Add(1)
+			if raw, err := io.ReadAll(r.Body); err == nil {
+				lastBody.Store(string(raw))
+			}
 			_, _ = io.WriteString(w, `{"ok":true}`)
 		case r.URL.Path == "/api/v1/agent/config/latest":
 			// 一直说有新配置：逼 agent 反复去应用（也就是一直卡在 blockHandler 上）
@@ -71,6 +76,12 @@ func TestRESTFallbackHeartbeatIsIndependentOfConfigApply(t *testing.T) {
 	cfg.Control.AllowInsecureWS = true
 	cfg.Control.HeartbeatIntervalSeconds = 1 // 每秒一次，便于断言
 	cfg.Control.RESTFallbackSeconds = 60
+	// 节点现状要上报给面板照抄（写死路径/secret 会让 agent 整份拒收配置）
+	hyCfg := filepath.Join(dir, "hysteria.yaml")
+	if err := os.WriteFile(hyCfg, []byte("tls:\n  cert: /etc/hysteria/cert.pem\n  key: /etc/hysteria/key.pem\ntrafficStats:\n  listen: 127.0.0.1:9999\n  secret: node-side-secret\n"), 0o600); err != nil {
+		t.Fatalf("write hysteria cfg: %v", err)
+	}
+	cfg.Hysteria.ConfigPath = hyCfg
 	cfg.Control.ConfigPollSeconds = 1
 	cfg.Control.ConfigApplyTimeoutSeconds = 600 // 应用永远不会超时返回
 	cfg.StateDir = dir
@@ -108,6 +119,17 @@ func TestRESTFallbackHeartbeatIsIndependentOfConfigApply(t *testing.T) {
 	}
 	if h.blocked.Load() == 0 {
 		t.Fatalf("配置轮询没有跑到（测试没覆盖到目标场景）")
+	}
+
+	// 心跳里必须带上「面板该照抄什么」：证书路径与 trafficStats（否则面板只能猜）
+	raw, _ := lastBody.Load().(string)
+	if raw == "" {
+		t.Fatalf("没有捕获到心跳正文")
+	}
+	for _, want := range []string{"/etc/hysteria/cert.pem", "/etc/hysteria/key.pem", "127.0.0.1:9999", "node-side-secret", "traffic_stats_secret"} {
+		if !strings.Contains(raw, want) {
+			t.Fatalf("心跳正文缺少 %q：%s", want, raw)
+		}
 	}
 
 	cancel()
