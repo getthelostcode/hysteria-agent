@@ -55,6 +55,7 @@ type Hysteria struct {
 	CertExpiresInDays  int      `json:"cert_expires_in_days,omitempty"`
 	ACMEDomains        []string `json:"acme_domains,omitempty"`
 	AuthType           string   `json:"auth_type"`
+	AuthURL            string   `json:"auth_url,omitempty"`
 	UserCount          int      `json:"user_count"`
 	MasqueradeType     string   `json:"masquerade_type,omitempty"`
 	TrafficStatsListen string   `json:"traffic_stats_listen,omitempty"`
@@ -237,11 +238,34 @@ func Validate(ctx context.Context, payload []byte, format string, opt ValidateOp
 					}
 				}
 			}
-		case "http", "command":
-			if _, ok := authMap[hy.AuthType]; !ok && hy.AuthType == "http" {
-				warn("auth.type=http 但未配置 auth.http.url")
+		case "http":
+			// HTTP 鉴权：节点会把鉴权请求转发到 auth.http.url。url 写错 = 所有用户都连不上，
+			// 所以要判死而不是警告（历史上这里只是 warn，配错了要等用户报故障才发现）。
+			httpRaw, ok := authMap["http"].(map[string]any)
+			if !ok {
+				fail("auth.type=http 但缺少 auth.http 配置块（需要 http.url）")
+				break
 			}
-			if _, ok := authMap["command"]; !ok && hy.AuthType == "command" {
+			url, _ := httpRaw["url"].(string)
+			url = strings.TrimSpace(url)
+			if url == "" {
+				fail("auth.type=http 但 auth.http.url 为空")
+			} else if !strings.HasPrefix(url, "http://") && !strings.HasPrefix(url, "https://") {
+				fail("auth.http.url %q 必须是 http:// 或 https:// 开头", url)
+			} else if strings.Contains(url, "@") {
+				warn("auth.http.url 里带了 userinfo（%s）：Hysteria 不会用它做鉴权，建议去掉", url)
+			}
+			hy.AuthURL = url
+			if v, ok := httpRaw["insecure"]; ok {
+				if _, isBool := v.(bool); !isBool {
+					fail("auth.http.insecure 必须是 true/false")
+				}
+			}
+			if strings.HasPrefix(url, "http://") {
+				warn("auth.http.url 使用明文 http://：鉴权凭据在链路上不加密，建议改成 https:// 并保持 insecure: false")
+			}
+		case "command":
+			if _, ok := authMap["command"]; !ok {
 				warn("auth.type=command 但未配置 auth.command")
 			}
 		}

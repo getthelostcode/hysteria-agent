@@ -270,3 +270,77 @@ func containsPrefix(list []string, prefix string) bool {
 	}
 	return false
 }
+
+func httpAuthConfig(cert, key string, port int, httpBlock string) string {
+	return fmt.Sprintf(`
+listen: :%d
+tls:
+  cert: %s
+  key: %s
+auth:
+  type: http
+  http:
+%s
+masquerade:
+  type: 404
+trafficStats:
+  listen: 127.0.0.1:18443
+  secret: statssecret
+`, port, cert, key, httpBlock)
+}
+
+// 面板模板生成的节点配置就是这种形状：auth.type=http + url + insecure: false。
+func TestValidateAcceptsHTTPAuthBackend(t *testing.T) {
+	dir := t.TempDir()
+	cert, key := genCert(t, dir, time.Now().Add(-time.Hour), time.Now().Add(90*24*time.Hour), "test.example.com")
+
+	res := Validate(context.Background(), []byte(httpAuthConfig(cert, key, 44310, "    url: http://auth.ipx.sarl\n    insecure: false")), "yaml",
+		ValidateOptions{OwnerPID: os.Getpid(), ExpectedTrafficSecret: "statssecret"})
+
+	if len(res.Errors) != 0 {
+		t.Fatalf("HTTP 鉴权配置应通过校验，错误：%v", res.Errors)
+	}
+	if res.Parsed == nil || res.Parsed.AuthType != "http" || res.Parsed.AuthURL != "http://auth.ipx.sarl" {
+		t.Fatalf("应识别出 http 鉴权后端，实际 %+v", res.Parsed)
+	}
+	// 明文 http 要有提醒（凭据在链路上不加密），但不能算错误
+	if !strings.Contains(strings.Join(res.Warnings, ";"), "明文 http") {
+		t.Fatalf("应提示明文 http 的风险，实际警告：%v", res.Warnings)
+	}
+}
+
+func TestValidateRejectsBrokenHTTPAuthBackend(t *testing.T) {
+	dir := t.TempDir()
+	cert, key := genCert(t, dir, time.Now().Add(-time.Hour), time.Now().Add(90*24*time.Hour), "test.example.com")
+
+	cases := map[string]string{
+		"缺少 http 块":     "    insecure: false",
+		"url 为空":        "    url: \"\"\n    insecure: false",
+		"url 没有 scheme": "    url: auth.ipx.sarl\n    insecure: false",
+		"insecure 非布尔":  "    url: https://auth.ipx.sarl\n    insecure: yes-please",
+	}
+
+	for name, block := range cases {
+		res := Validate(context.Background(), []byte(httpAuthConfig(cert, key, 44311, block)), "yaml",
+			ValidateOptions{OwnerPID: os.Getpid(), ExpectedTrafficSecret: "statssecret"})
+
+		if len(res.Errors) == 0 {
+			t.Fatalf("%s 应被判为错误，实际：%v", name, res.Errors)
+		}
+	}
+}
+
+func TestValidateHTTPSAuthBackendHasNoPlaintextWarning(t *testing.T) {
+	dir := t.TempDir()
+	cert, key := genCert(t, dir, time.Now().Add(-time.Hour), time.Now().Add(90*24*time.Hour), "test.example.com")
+
+	res := Validate(context.Background(), []byte(httpAuthConfig(cert, key, 44312, "    url: https://auth.ipx.sarl\n    insecure: false")), "yaml",
+		ValidateOptions{OwnerPID: os.Getpid(), ExpectedTrafficSecret: "statssecret"})
+
+	if len(res.Errors) != 0 {
+		t.Fatalf("https 鉴权后端不应报错：%v", res.Errors)
+	}
+	if strings.Contains(strings.Join(res.Warnings, ";"), "明文 http") {
+		t.Fatalf("https 不该有明文 http 警告：%v", res.Warnings)
+	}
+}
