@@ -20,6 +20,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -487,7 +488,7 @@ func (a *Agent) ApplyPayload(ctx context.Context, payload []byte, format, revisi
 	defer cancel()
 	if err := a.sup.Reload(rctx, fmt.Sprintf("配置更新 rev=%s", revision)); err != nil {
 		ack.Ok = false
-		ack.Error = "配置已写入但 Hysteria 未能以新配置就绪: " + err.Error()
+		ack.Error = "配置已写入但 Hysteria 未能以新配置就绪: " + err.Error() + hysteriaLogHint(a.sup)
 		a.m.ConfigApplyTotal.WithLabelValues("failed").Inc()
 		// 5) 自动回滚
 		if rb, rerr := a.rollbackLocked(rctx, "配置应用失败自动回滚"); rerr == nil {
@@ -637,6 +638,37 @@ func (a *Agent) refreshCurrentConfig() {
 	if sum != "" {
 		a.log.Info("检测到已有配置", slog.String("revision", rev), slog.String("sha256", short(sum)))
 	}
+}
+
+// hysteriaLogHint 把 Hysteria 最后几行输出附在错误后面。
+//
+// 价值：真实现场（japan2 重启风暴）面板上只能看到「exit=1」这种总结，看不出 Hysteria 到底
+// 在抱怨什么，必须登机器翻 journal。子进程的 stderr 就在 supervisor 手里，顺手带上即可。
+func hysteriaLogHint(sup interface{ RecentLogs(int) []string }) string {
+	if sup == nil {
+		return ""
+	}
+	lines := sup.RecentLogs(6)
+	if len(lines) == 0 {
+		return ""
+	}
+	// 只留有用的部分并限制长度，避免把回执撑爆。
+	out := make([]string, 0, len(lines))
+	for _, l := range lines {
+		l = strings.TrimSpace(l)
+		if l == "" {
+			continue
+		}
+		if len(l) > 200 {
+			l = l[:200] + "…"
+		}
+		out = append(out, l)
+	}
+	if len(out) == 0 {
+		return ""
+	}
+
+	return "；Hysteria 最后输出: " + strings.Join(out, " | ")
 }
 
 // reportSupervisorEvent 把子进程事件转成 NodeEvent 上报。
