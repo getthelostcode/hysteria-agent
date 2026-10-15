@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	neturl "net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -397,13 +398,18 @@ const defaultRESTConfigPath = "/api/v1/agent/config/latest"
 //
 // 守护进程的兜底轮询与 CLI 的 `hysteria-agent config sync` 共用这一份实现：
 // 鉴权（node_secret 自签 JWT）、TLS/pinning、错误处理都不该有两份，否则迟早分叉。
-func FetchLatestConfig(ctx context.Context, cfg *config.Config, cr *creds.Credentials, currentVersion int) (*LatestConfig, error) {
+func FetchLatestConfig(ctx context.Context, cfg *config.Config, cr *creds.Credentials, currentVersion int, currentSHA string) (*LatestConfig, error) {
 	path := cfg.Control.RESTConfigPath
 	if path == "" {
 		path = defaultRESTConfigPath
 	}
 
 	url := fmt.Sprintf("%s?current_version=%d", cfg.ControlHTTPURL(path), currentVersion)
+	// 带上当前生效配置的 sha256：控制面就地把某个版本的正文改掉时版本号不变，
+	// 只比版本号会让「改动」永远下不来。
+	if strings.TrimSpace(currentSHA) != "" {
+		url += "&current_sha256=" + neturl.QueryEscape(currentSHA)
+	}
 
 	reqCtx, cancel := context.WithTimeout(ctx, cfg.Control.ConnectTimeout())
 	defer cancel()
@@ -460,7 +466,7 @@ func (c *Client) pollRESTConfig(ctx context.Context) {
 	current := c.restConfigVersion
 	c.mu.Unlock()
 
-	rc, err := FetchLatestConfig(ctx, c.cfg, c.cr, current)
+	rc, err := FetchLatestConfig(ctx, c.cfg, c.cr, current, c.configSHA256Snapshot())
 	if err != nil {
 		c.m.RESTConfigFailures.Inc()
 		c.log.Warn("REST 拉取配置失败", "error", err.Error())

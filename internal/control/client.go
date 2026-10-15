@@ -809,6 +809,14 @@ func (c *Client) hysteriaVersionSnapshot() string {
 	return c.hysteriaVersion
 }
 
+// configSHA256Snapshot 返回当前生效配置的 sha256（心跳/取配置时上报给控制面）。
+func (c *Client) configSHA256Snapshot() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	return c.configSHA256
+}
+
 func (c *Client) configRevisionSnapshot() string {
 	c.mu.Lock()
 	defer c.mu.Unlock()

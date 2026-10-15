@@ -591,9 +591,18 @@ func syncConfig(cfgPath string, force, strict, dryRun, reload bool) int {
 
 	ctx := context.Background()
 
+	local, err := os.ReadFile(cfg.Hysteria.ConfigPath)
+	if err != nil && !os.IsNotExist(err) {
+		fmt.Fprintf(os.Stderr, "读取 %s 失败: %v\n", cfg.Hysteria.ConfigPath, err)
+
+		return 1
+	}
+	localSum := sha256Hex(local)
+
 	// current_version=0 表示「不管本机是第几版」：控制面应当把最新正文给我们，
 	// 由下面的 sha256 比对决定要不要写 —— 版本号只是面板的记账，不能代替内容比对。
-	rc, err := control.FetchLatestConfig(ctx, cfg, cr, 0)
+	// 同时把本机内容的 sha 带过去：控制面就地改过版本正文时版本号不变，靠它才认得出来。
+	rc, err := control.FetchLatestConfig(ctx, cfg, cr, 0, localSum)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "从控制面拉取配置失败: %v\n", err)
 
@@ -608,14 +617,6 @@ func syncConfig(cfgPath string, force, strict, dryRun, reload bool) int {
 
 	payload := []byte(rc.Content)
 	want := sha256Hex(payload)
-
-	local, err := os.ReadFile(cfg.Hysteria.ConfigPath)
-	if err != nil && !os.IsNotExist(err) {
-		fmt.Fprintf(os.Stderr, "读取 %s 失败: %v\n", cfg.Hysteria.ConfigPath, err)
-
-		return 1
-	}
-	localSum := sha256Hex(local)
 
 	if localSum == want && len(local) > 0 {
 		fmt.Printf("已是最新配置（与面板 v%d 内容一致，sha256=%s），未改动 %s\n",
