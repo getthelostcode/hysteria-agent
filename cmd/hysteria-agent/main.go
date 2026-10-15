@@ -14,6 +14,8 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -23,7 +25,6 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -564,10 +565,14 @@ func storeVersion(ctx context.Context, bin string) string {
 
 // syncConfig 把控制面上最新发布的配置同步到本机。
 //
-// 为什么要有它：`install.sh` 跑完就该让 VPS 立刻用上面板里的配置，而不是等 agent 起来轮询；
-// 同时这也是运维「现在就同步」的一条命令。写入前一律先校验 + 存历史快照，
-// 校验不过就保持现有文件不动（宁可不同步，也不能把能用的配置换坏）。
-func syncConfig(cfgPath string, currentFlag int, force, dryRun, reload bool) int {
+// 语义（用户要求）：**跑完，本机的 hysteria 配置就是控制面上最新发布的那一份**。
+// 所以不是「版本号一样就跳过」，而是每次都取回最新正文，与磁盘内容按 sha256 比对：
+//   - 一致 → 什么都不做（幂等）；
+//   - 不一致 → 校验，通过就原子写 0600 + 留历史快照；不通过就如实报原因并保持现有文件不动
+//     （agent 侧会硬校验 trafficStats.secret 与证书路径，宁可不同步也不能把能用的配置换坏）。
+//
+// install.sh 的第 5 步与运维手工都用它；`--dry-run` 只看不写，`--reload` 顺带重启被守护的 Hysteria。
+func syncConfig(cfgPath string, force, dryRun, reload bool) int {
 	cfg, err := loadOrInitConfig(cfgPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "加载配置失败: %v\n", err)
@@ -584,43 +589,42 @@ func syncConfig(cfgPath string, currentFlag int, force, dryRun, reload bool) int
 
 	store := hyconfig.NewStore(cfg.Hysteria.HistoryDir, cfg.Hysteria.ConfigPath, cfg.Hysteria.HistoryKeep)
 
-	current := currentFlag
-	if current < 0 {
-		// 只有本机文件与某条历史记录逐字节一致时才算「本机是那一版」。
-		// 对不上（回滚过、被拒绝过、被手工改过）就按未知处理，重新去控制面取 ——
-		// 否则会误报「已是最新」，节点永远取不到修好的配置。
-		exact, err := store.CurrentExact()
-		switch {
-		case err != nil:
-			fmt.Fprintf(os.Stderr, "读取本机配置历史失败（按未知版本处理）: %v\n", err)
-		case exact != nil:
-			current = leadingInt(exact.Revision)
-		default:
-			current = 0
-			fmt.Fprintf(os.Stderr,
-				"本机 %s 与任何历史记录都不一致（被拒绝过/回滚过/手工改过）→ 按未知版本处理，重新取控制面最新配置\n",
-				cfg.Hysteria.ConfigPath)
-		}
-	}
-
 	ctx := context.Background()
 
-	rc, err := control.FetchLatestConfig(ctx, cfg, cr, current)
+	// current_version=0 表示「不管本机是第几版」：控制面应当把最新正文给我们，
+	// 由下面的 sha256 比对决定要不要写 —— 版本号只是面板的记账，不能代替内容比对。
+	rc, err := control.FetchLatestConfig(ctx, cfg, cr, 0)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "从控制面拉取配置失败: %v\n", err)
 
 		return 1
 	}
 
-	if rc.UpToDate || strings.TrimSpace(rc.Content) == "" {
-		fmt.Printf("已是最新配置（本机 v%d，控制面没有更新的版本），未改动 %s\n", current, cfg.Hysteria.ConfigPath)
+	if strings.TrimSpace(rc.Content) == "" {
+		fmt.Printf("控制面还没有已发布的配置，未改动 %s\n", cfg.Hysteria.ConfigPath)
 
 		return 0
 	}
 
 	payload := []byte(rc.Content)
+	want := sha256Hex(payload)
 
-	// 校验：不过就不写。默认严格，--force 才放行（面板模板写错时别把节点弄挂）。
+	local, err := os.ReadFile(cfg.Hysteria.ConfigPath)
+	if err != nil && !os.IsNotExist(err) {
+		fmt.Fprintf(os.Stderr, "读取 %s 失败: %v\n", cfg.Hysteria.ConfigPath, err)
+
+		return 1
+	}
+	localSum := sha256Hex(local)
+
+	if localSum == want && len(local) > 0 {
+		fmt.Printf("已是最新配置（与面板 v%d 内容一致，sha256=%s），未改动 %s\n",
+			rc.Version, want, cfg.Hysteria.ConfigPath)
+
+		return 0
+	}
+
+	// 校验：不过就不写，并说清楚差在哪（面板写的值常与节点现状不符）。
 	res := hyconfig.Validate(ctx, payload, "yaml", hyconfig.ValidateOptions{
 		CheckPort: true, CheckCert: true, CertWarnDays: cfg.Hysteria.CertWarnDays,
 		RequireTrafficStats: false, ExpectedTrafficSecret: cfg.Hysteria.APISecret,
@@ -628,7 +632,8 @@ func syncConfig(cfgPath string, currentFlag int, force, dryRun, reload bool) int
 	})
 	if !res.Valid {
 		b, _ := json.MarshalIndent(res, "", "  ")
-		fmt.Fprintf(os.Stderr, "控制面 v%d 的配置没通过校验，未写入：\n%s\n", rc.Version, string(b))
+		fmt.Fprintf(os.Stderr, "控制面 v%d 的配置没通过校验，未写入（本机 %s 保持不变）：\n%s\n",
+			rc.Version, cfg.Hysteria.ConfigPath, string(b))
 
 		if !force {
 			return 1
@@ -638,9 +643,15 @@ func syncConfig(cfgPath string, currentFlag int, force, dryRun, reload bool) int
 
 	if dryRun {
 		b, _ := json.MarshalIndent(res, "", "  ")
-		fmt.Printf("--dry-run：控制面 v%d sha256=%s（%d 字节），校验结果：\n%s\n", rc.Version, rc.SHA256, len(payload), string(b))
+		fmt.Printf("--dry-run：控制面 v%d sha256=%s（%d 字节），校验结果：\n%s\n",
+			rc.Version, want, len(payload), string(b))
 
 		return 0
+	}
+
+	if len(local) > 0 {
+		fmt.Printf("本机 %s 与面板 v%d 不一致（本机 sha256=%s）→ 覆盖为本机最新\n",
+			cfg.Hysteria.ConfigPath, rc.Version, short(localSum))
 	}
 
 	snap, err := store.Snapshot(payload, rc.Revision, "yaml", "control-plane-sync", fmt.Sprintf("面板下发 v%d", rc.Version))
@@ -649,8 +660,7 @@ func syncConfig(cfgPath string, currentFlag int, force, dryRun, reload bool) int
 
 		return 1
 	}
-	// Snapshot 只写快照文件，索引要单独记：没有索引，下次就认不出「当前是哪一版」，
-	// 于是每次 sync 都重写一遍（第一次写就踩了这个坑）。
+	// Snapshot 只写快照文件，索引要单独记：没有索引，下次就认不出「当前是哪一版」。
 	if err := store.Record(*snap); err != nil {
 		fmt.Fprintf(os.Stderr, "记录配置历史失败: %v\n", err)
 
@@ -666,7 +676,7 @@ func syncConfig(cfgPath string, currentFlag int, force, dryRun, reload bool) int
 		fmt.Fprintf(os.Stderr, "清理旧快照失败（不影响本次同步）: %v\n", err)
 	}
 
-	fmt.Printf("已同步控制面 v%d（sha256=%s）→ %s\n", rc.Version, rc.SHA256, path)
+	fmt.Printf("已同步控制面 v%d（sha256=%s）→ %s\n", rc.Version, want, path)
 	fmt.Printf("历史快照: rev=%s（回滚：hysteria-agent config rollback -config %s）\n", snap.Revision, cfgPath)
 
 	if reload {
@@ -681,7 +691,8 @@ func syncConfig(cfgPath string, currentFlag int, force, dryRun, reload bool) int
 			return 1
 		}
 		if out, err := exec.Command("systemctl", "try-restart", cfg.Hysteria.ServiceName).CombinedOutput(); err != nil {
-			fmt.Fprintf(os.Stderr, "systemctl try-restart %s 失败: %v (%s)\n", cfg.Hysteria.ServiceName, err, strings.TrimSpace(string(out)))
+			fmt.Fprintf(os.Stderr, "systemctl try-restart %s 失败: %v (%s)\n",
+				cfg.Hysteria.ServiceName, err, strings.TrimSpace(string(out)))
 
 			return 1
 		}
@@ -689,6 +700,25 @@ func syncConfig(cfgPath string, currentFlag int, force, dryRun, reload bool) int
 	}
 
 	return 0
+}
+
+// sha256Hex 计算 sha256（空内容给空串，便于判断「文件不存在」）。
+func sha256Hex(b []byte) string {
+	if len(b) == 0 {
+		return ""
+	}
+	sum := sha256.Sum256(b)
+
+	return hex.EncodeToString(sum[:])
+}
+
+// short 取哈希前 12 位，日志里够用。
+func short(sum string) string {
+	if len(sum) <= 12 {
+		return sum
+	}
+
+	return sum[:12]
 }
 
 // normalizeConfigArgs 把 -config/-c 从任意位置提到前面，便于按 argv[0] 分发子命令。
@@ -714,24 +744,6 @@ func normalizeConfigArgs(argv []string) []string {
 	return append(rest, pre...)
 }
 
-// leadingInt 取字符串开头的整数（版本号可能是 "6" 这类），取不到返回 0。
-func leadingInt(s string) int {
-	s = strings.TrimSpace(s)
-	end := 0
-	for end < len(s) && s[end] >= '0' && s[end] <= '9' {
-		end++
-	}
-	if end == 0 {
-		return 0
-	}
-	n, err := strconv.Atoi(s[:end])
-	if err != nil {
-		return 0
-	}
-
-	return n
-}
-
 func cmdConfig(argv []string) int {
 	// main 允许把 -config 写在子命令之前（`hysteria-agent -config x config sync`），
 	// 而这里按 argv[0] 分发子命令 —— 先把 -config 归位，两种写法都能用。
@@ -745,13 +757,12 @@ func cmdConfig(argv []string) int {
 	case "sync":
 		fs := flag.NewFlagSet("config sync", flag.ExitOnError)
 		cfgPath := fs.String("config", config.DefaultConfigPath, "agent 配置文件路径")
-		current := fs.Int("current-version", -1, "本机已应用的配置版本（默认从历史推断）")
 		force := fs.Bool("force", false, "校验未通过也写入（不建议）")
 		dryRun := fs.Bool("dry-run", false, "只拉取并打印，不落盘")
 		reload := fs.Bool("reload", false, "写完后重启被守护的 Hysteria 服务")
 		_ = fs.Parse(argv[1:])
 
-		return syncConfig(*cfgPath, *current, *force, *dryRun, *reload)
+		return syncConfig(*cfgPath, *force, *dryRun, *reload)
 
 	case "validate":
 		fs := flag.NewFlagSet("config validate", flag.ExitOnError)

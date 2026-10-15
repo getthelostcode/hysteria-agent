@@ -47,7 +47,7 @@ elif action == "issue_token":
 elif action == "publish":
     st, body = call("POST", f"/api/admin/v1/nodes/{args[0]}/configs", {"content_yaml": args[1], "reason": args[2]}, token())
     d = body.get("data") or body
-    print("status", st); print("version", d.get("version"))
+    print("status", st); print("version", d.get("version")); print("sha256", d.get("sha256"))
 elif action == "delete_node": print("delete", call("DELETE", f"/api/admin/v1/nodes/{args[0]}", None, token())[0])
 elif action == "revoke_token": print("revoke", call("DELETE", f"/api/admin/v1/enroll-tokens/{args[0]}", None, token())[0])
 PY
@@ -132,7 +132,9 @@ trafficStats:
   secret: e2e-stats-secret
 # marker: from-panel-v1
 "
-V1="$(panel publish "$NODE_ID" "$V1_YAML" "config-sync v1" | sed -n 's/^version //p')"
+PUB1="$(panel publish "$NODE_ID" "$V1_YAML" "config-sync v1")"
+V1="$(printf '%s\n' "$PUB1" | sed -n 's/^version //p')"
+SHA1="$(printf '%s\n' "$PUB1" | sed -n 's/^sha256 //p')"
 [[ -n "$V1" ]] && ok "发布 v$V1" || { bad "发布失败"; exit 1; }
 
 "$WORK/bin/hysteria-agent" -config "$WORK/etc/agent/config.yaml" config sync >"$WORK/logs/sync1.log" 2>&1
@@ -144,6 +146,7 @@ check "auth 段是 HTTP 鉴权" "grep -q 'url: https://auth.ipx.sarl' '$WORK/etc
 check "权限 600" "[ \"\$(stat -c %a '$WORK/etc/hysteria/config.yaml')\" = '600' ]"
 check "留了历史快照（可回滚）" "ls '$WORK/etc/hysteria/history' 2>/dev/null | grep -q ."
 check "输出里带了版本与 sha" "grep -q '已同步控制面 v$V1' '$WORK/logs/sync1.log'"
+check "落盘内容与面板发布的 sha256 一致（跑完就是最新那份）" "[ \"\$(sha256sum '$WORK/etc/hysteria/config.yaml' | cut -d' ' -f1)\" = '$SHA1' ]"
 
 log "4) 再 sync 一次：已是最新，不该重复写"
 BEFORE="$(stat -c %Y "$WORK/etc/hysteria/config.yaml")"
@@ -185,9 +188,17 @@ check "去掉 dry-run 后正常落盘" "grep -q 'marker: from-panel-v4' '$WORK/e
 log "7) 本机文件被手工改过/曾被拒绝 → 不能误报「已是最新」"
 printf '\n# 手工追加的一行\n' >> "$WORK/etc/hysteria/config.yaml"
 "$WORK/bin/hysteria-agent" -config "$WORK/etc/agent/config.yaml" config sync >"$WORK/logs/sync6.log" 2>&1
-check "明确说明本机与历史不一致" "grep -q '与任何历史记录都不一致' '$WORK/logs/sync6.log'"
+check "说明本机与面板不一致并覆盖" "grep -Eq '与面板 v[0-9]+ 不一致' '$WORK/logs/sync6.log'"
 check "重新落盘（覆盖掉手工改动）" "! grep -q '手工追加的一行' '$WORK/etc/hysteria/config.yaml'"
 check "仍与面板一致" "grep -q 'marker: from-panel-v4' '$WORK/etc/hysteria/config.yaml'"
+
+log "7b) 面板内容与磁盘一致（重复发布同一份）→ 明确说「已是最新」，不写盘"
+M1="$(stat -c %Y "$WORK/etc/hysteria/config.yaml")"
+panel publish "$NODE_ID" "$V4_YAML" "config-sync v4 再发一次" >/dev/null
+sleep 1
+"$WORK/bin/hysteria-agent" -config "$WORK/etc/agent/config.yaml" config sync >"$WORK/logs/sync7.log" 2>&1
+check "按内容判定为已是最新" "grep -q '已是最新配置（与面板' '$WORK/logs/sync7.log'"
+[[ "$(stat -c %Y "$WORK/etc/hysteria/config.yaml")" == "$M1" ]] && ok "内容一致就不写盘" || bad "内容一致却写盘了"
 
 log "8) 清理"
 panel delete_node "$NODE_ID" >/dev/null
