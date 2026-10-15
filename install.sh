@@ -212,25 +212,87 @@ info "步骤 1/5：安装 hysteria-agent 二进制"
 if [[ -x "$AGENT_BIN" ]]; then
   info "已存在 $AGENT_BIN（将覆盖为新版本；旧文件备份为 $AGENT_BIN.bak）"
 fi
-SRC_BIN="${AGENT_BINARY:-}"
-if [[ -z "$SRC_BIN" && -x "$SCRIPT_DIR/bin/hysteria-agent" ]]; then
-  SRC_BIN="$SCRIPT_DIR/bin/hysteria-agent"
-fi
-if [[ -n "$SRC_BIN" ]]; then
-  [[ -x "$SRC_BIN" ]] || die "$SRC_BIN 不可执行"
-  install -m 0755 "$SRC_BIN" "$AGENT_BIN.new"
-elif [[ -n "${AGENT_BINARY_URL:-}" ]]; then
-  info "下载 $AGENT_BINARY_URL"
-  curl -fsSL "$AGENT_BINARY_URL" -o "$AGENT_BIN.new" || die "下载失败"
+
+ARCH="$(detect_arch)"
+AGENT_REPO_SLUG="${AGENT_REPO_SLUG:-getthelostcode/hysteria-agent}"
+AGENT_VERSION="${AGENT_VERSION:-0.1.0}"
+RAW_BASE="https://raw.githubusercontent.com/${AGENT_REPO_SLUG}/master"
+
+# 找一个可用的本地二进制来源。仓库里带的是编译好的发布产物：
+#   dist/hysteria-agent-linux-<arch>                     单文件（amd64）
+#   release/hysteria-agent-<ver>-linux-<arch>.tar.gz     完整包（amd64/arm64）
+#   bin/hysteria-agent                                   本机 make build 的产物
+resolve_local_agent() {
+  local cands=(
+    "${AGENT_BINARY:-}"
+    "$SCRIPT_DIR/bin/hysteria-agent"
+    "$SCRIPT_DIR/dist/hysteria-agent-linux-$ARCH"
+    "$SCRIPT_DIR/release/hysteria-agent-$AGENT_VERSION-linux-$ARCH/bin/hysteria-agent"
+  )
+  local c
+  for c in "${cands[@]}"; do
+    [[ -n "$c" && -x "$c" ]] && { echo "$c"; return 0; }
+  done
+  # 从仓库里的发布包（tarball）里取
+  local t tmp
+  for t in "$SCRIPT_DIR"/release/hysteria-agent-*-linux-"$ARCH".tar.gz; do
+    [[ -f "$t" ]] || continue
+    tmp="$(mktemp -d)"
+    if tar -xzf "$t" -C "$tmp" 2>/dev/null; then
+      c="$(find "$tmp" -type f -name hysteria-agent -perm -u+x 2>/dev/null | head -1)"
+      if [[ -n "$c" ]]; then echo "$c"; return 0; fi
+    fi
+    rm -rf "$tmp"
+  done
+  return 1
+}
+
+# 本地都没有时，从 GitHub 拉（单文件优先，其次发布包）。
+download_agent() {
+  [[ "${AGENT_NO_DOWNLOAD:-0}" == "1" ]] && return 1
+  local url
+  for url in "$RAW_BASE/dist/hysteria-agent-linux-$ARCH" \
+             "$RAW_BASE/release/hysteria-agent-$AGENT_VERSION-linux-$ARCH.tar.gz"; do
+    info "尝试下载 $url"
+    if [[ "$url" == *.tar.gz ]]; then
+      local tmp; tmp="$(mktemp -d)"
+      if curl -fsSL "$url" -o "$tmp/pkg.tar.gz" && tar -xzf "$tmp/pkg.tar.gz" -C "$tmp" 2>/dev/null; then
+        local found; found="$(find "$tmp" -type f -name hysteria-agent -perm -u+x | head -1)"
+        if [[ -n "$found" ]]; then install -m 0755 "$found" "$AGENT_BIN.new"; rm -rf "$tmp"; return 0; fi
+      fi
+      rm -rf "$tmp"
+    elif curl -fsSL "$url" -o "$AGENT_BIN.new"; then
+      chmod 0755 "$AGENT_BIN.new"; return 0
+    fi
+  done
+  return 1
+}
+
+SRC_BIN=""
+if [[ -n "${AGENT_BINARY_URL:-}" ]]; then
+  info "下载 AGENT_BINARY_URL=$AGENT_BINARY_URL"
+  curl -fsSL "$AGENT_BINARY_URL" -o "$AGENT_BIN.new" || die "下载 $AGENT_BINARY_URL 失败"
   chmod 0755 "$AGENT_BIN.new"
+elif SRC_BIN="$(resolve_local_agent)"; then
+  info "使用本地二进制：$SRC_BIN"
+  install -m 0755 "$SRC_BIN" "$AGENT_BIN.new"
+elif download_agent; then
+  info "已从 GitHub 下载 agent 二进制"
 elif [[ -x "$AGENT_BIN" ]]; then
-  rm -f "$AGENT_BIN.new"
+  info "没有新二进制来源，沿用已安装的 $AGENT_BIN"
 else
-  die "没有找到 agent 二进制：把编译好的 bin/hysteria-agent 放到脚本旁，或用 AGENT_BINARY=/path AGENT_BINARY_URL=... 指定"
+  die "找不到 agent 二进制（架构 $ARCH）。三种办法任选：
+   1) 直接下载发布包：curl -fsSLO ${RAW_BASE}/release/hysteria-agent-${AGENT_VERSION}-linux-${ARCH}.tar.gz && tar -xzf hysteria-agent-${AGENT_VERSION}-linux-${ARCH}.tar.gz && cd hysteria-agent-${AGENT_VERSION}-linux-${ARCH} && bash install.sh <控制面地址> --token=...
+   2) 指定现成文件：AGENT_BINARY=/path/to/hysteria-agent bash install.sh <控制面地址> --token=...
+   3) 指定下载地址：AGENT_BINARY_URL=https://... bash install.sh <控制面地址> --token=...
+   4) 自行编译：make build（需要 Go 1.23+，产物在 bin/hysteria-agent）"
 fi
 if [[ -f "$AGENT_BIN.new" ]]; then
   if ! "$AGENT_BIN.new" version >/dev/null 2>&1; then
-    rm -f "$AGENT_BIN.new"; die "新二进制无法执行（架构不匹配？），已中止"
+    rm -f "$AGENT_BIN.new"
+    die "新二进制无法执行（本机架构 $ARCH，来源 $SRC_BIN）——多半是拿到了别的架构的包。
+   本机应使用：${RAW_BASE}/release/hysteria-agent-${AGENT_VERSION}-linux-${ARCH}.tar.gz
+   或自己编译：make build"
   fi
   [[ -f "$AGENT_BIN" ]] && cp -f "$AGENT_BIN" "$AGENT_BIN.bak"
   mv -f "$AGENT_BIN.new" "$AGENT_BIN"
