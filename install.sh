@@ -164,6 +164,82 @@ read_yaml_value() { # read_yaml_value <file> <key>  —— 只取第一个匹配
   awk -v k="^[[:space:]]*$key[[:space:]]*:" '$0 ~ k { sub(/^[^:]*:[[:space:]]*/, ""); gsub(/^["'"'"']|["'"'"']$/, ""); print; exit }' "$file"
 }
 
+# ---------------------------------------------------------------- 鉴权函数
+# 必须在**调用点之前**定义：第 2 节生成 Hysteria 配置时会用它们。
+# 曾经放在调用点之后 → install.sh 一跑就 emit_auth_block: command not found 直接中止。
+# 输出 auth 段：HTTP 鉴权（默认）或老的静态密码
+# $1=mode $2=password $3=url $4=insecure
+emit_auth_block() {
+  local mode="$1" pass="$2" url="$3" insecure="$4"
+  if [[ "$mode" == "password" ]]; then
+    printf 'auth:\n  type: password\n  password: %s\n' "$pass"
+  else
+    printf 'auth:\n  type: http\n  http:\n    url: %s\n    insecure: %s\n' \
+      "$url" "$([[ "$insecure" == "1" ]] && echo true || echo false)"
+  fi
+}
+
+# 把**已有**配置的 auth 段就地换成 HTTP 鉴权：只动 auth，证书/masquerade/trafficStats 一字不动。
+#
+# 为什么需要它：老节点上写的是 auth.type=password 的静态密码 —— 用户离开平台后依然能连，
+# 也没法按流量/到期回收；而重新生成整份配置会顺手改掉运维自己的 masquerade、证书路径。
+# 为什么必须显式触发：鉴权后端不可达时切过去等于把所有人关在门外，例行重跑脚本不该有这种副作用。
+# $1=配置路径 $2=url $3=insecure(0/1)
+set_hysteria_auth_http() {
+  local cfg="$1" url="$2" insecure="$3"
+  local backup tmp stripped insert_at units
+
+  [[ -f "$cfg" ]] || die "配置文件不存在：$cfg"
+  [[ -n "$url" ]] || die "auth.http.url 不能为空"
+  case "$url" in
+    http://*|https://*) ;;
+    *) die "auth.http.url 必须是 http:// 或 https:// 开头：$url" ;;
+  esac
+
+  backup="${cfg}.bak.$(date +%Y%m%d%H%M%S)"
+  tmp="$(mktemp)"
+  stripped="$(mktemp)"
+
+  # 顶层的 auth: 段整体删掉（遇到下一个非缩进的 key 就恢复输出）
+  awk '
+    /^[^[:space:]#][^:]*:/ { in_auth = ($0 ~ /^auth:[[:space:]]*(#.*)?$/) ? 1 : 0 }
+    in_auth == 0 { print }
+  ' "$cfg" > "$stripped"
+
+  insert_at="$(grep -nE '^(trafficStats|masquerade|bandwidth|acl|quic|resolver|outbounds):' "$stripped" | head -1 | cut -d: -f1 || true)"
+  if [[ -n "$insert_at" && "$insert_at" -gt 1 ]]; then
+    head -n "$((insert_at - 1))" "$stripped" > "$tmp"
+    emit_auth_block http "" "$url" "$insecure" >> "$tmp"
+    printf '\n' >> "$tmp"
+    tail -n "+$insert_at" "$stripped" >> "$tmp"
+  else
+    cat "$stripped" > "$tmp"
+    printf '\n' >> "$tmp"
+    emit_auth_block http "" "$url" "$insecure" >> "$tmp"
+  fi
+  rm -f "$stripped"
+
+  cp -a "$cfg" "$backup"
+  cat "$tmp" > "$cfg"
+  rm -f "$tmp"
+  chmod 600 "$cfg"
+
+  log "已把 auth 段换成 HTTP 鉴权：$url（insecure=$([[ "$insecure" == "1" ]] && echo true || echo false)）"
+  info "  备份：$backup"
+  info "  其余内容（证书 / masquerade / trafficStats）未改动"
+
+  if [[ "$HAS_SYSTEMD" -eq 1 ]]; then
+    units="$(systemctl list-unit-files 2>/dev/null || true)"
+    if grep -q "^$HY_SERVICE.service" <<<"$units"; then
+      systemctl restart "$HY_SERVICE" && log "已重启 $HY_SERVICE" \
+        || warn "重启 $HY_SERVICE 失败：配置已改，请手动检查（备份 $backup）"
+    else
+      warn "没找到 $HY_SERVICE.service：请手动重启 Hysteria"
+    fi
+  fi
+}
+
+
 # ---------------------------------------------------------------- 0. verify-only
 verify() {
   local rc=0
@@ -358,7 +434,11 @@ if [[ $NO_HYSTERIA -eq 0 ]]; then
   fi
 
   if [[ ! -f "$HY_CFG" ]]; then
-    info "生成 $HY_CFG（自签证书 + 随机密码 + trafficStats）"
+    if [[ "$HYSTERIA_AUTH_MODE" == "password" ]]; then
+      info "生成 $HY_CFG（自签证书 + 随机密码 + trafficStats）"
+    else
+      info "生成 $HY_CFG（自签证书 + HTTP 鉴权 $HYSTERIA_AUTH_URL + trafficStats）"
+    fi
     mkdir -p "$(dirname "$HY_CFG")"
     TLS_BLOCK=""
     if [[ -n "${HYSTERIA_DOMAIN:-}" ]]; then
@@ -391,7 +471,11 @@ trafficStats:
   listen: 127.0.0.1:8080
   secret: $HY_STATS_SECRET
 EOF
-    log "已生成 Hysteria 配置（密码与 trafficStats secret 均为随机值）"
+    if [[ "$HYSTERIA_AUTH_MODE" == "password" ]]; then
+      log "已生成 Hysteria 配置（静态密码与 trafficStats secret 均为随机值）"
+    else
+      log "已生成 Hysteria 配置（HTTP 鉴权 $HYSTERIA_AUTH_URL + 随机 trafficStats secret）"
+    fi
   else
     log "复用已有 $HY_CFG（不会改动它的其它内容）"
 
@@ -406,79 +490,7 @@ EOF
     fi
   fi
 
-  # 输出 auth 段：HTTP 鉴权（默认）或老的静态密码
-# $1=mode $2=password $3=url $4=insecure
-emit_auth_block() {
-  local mode="$1" pass="$2" url="$3" insecure="$4"
-  if [[ "$mode" == "password" ]]; then
-    printf 'auth:\n  type: password\n  password: %s\n' "$pass"
-  else
-    printf 'auth:\n  type: http\n  http:\n    url: %s\n    insecure: %s\n' \
-      "$url" "$([[ "$insecure" == "1" ]] && echo true || echo false)"
-  fi
-}
-
-# 把**已有**配置的 auth 段就地换成 HTTP 鉴权：只动 auth，证书/masquerade/trafficStats 一字不动。
-#
-# 为什么需要它：老节点上写的是 auth.type=password 的静态密码 —— 用户离开平台后依然能连，
-# 也没法按流量/到期回收；而重新生成整份配置会顺手改掉运维自己的 masquerade、证书路径。
-# 为什么必须显式触发：鉴权后端不可达时切过去等于把所有人关在门外，例行重跑脚本不该有这种副作用。
-# $1=配置路径 $2=url $3=insecure(0/1)
-set_hysteria_auth_http() {
-  local cfg="$1" url="$2" insecure="$3"
-  local backup tmp stripped insert_at units
-
-  [[ -f "$cfg" ]] || die "配置文件不存在：$cfg"
-  [[ -n "$url" ]] || die "auth.http.url 不能为空"
-  case "$url" in
-    http://*|https://*) ;;
-    *) die "auth.http.url 必须是 http:// 或 https:// 开头：$url" ;;
-  esac
-
-  backup="${cfg}.bak.$(date +%Y%m%d%H%M%S)"
-  tmp="$(mktemp)"
-  stripped="$(mktemp)"
-
-  # 顶层的 auth: 段整体删掉（遇到下一个非缩进的 key 就恢复输出）
-  awk '
-    /^[^[:space:]#][^:]*:/ { in_auth = ($0 ~ /^auth:[[:space:]]*(#.*)?$/) ? 1 : 0 }
-    in_auth == 0 { print }
-  ' "$cfg" > "$stripped"
-
-  insert_at="$(grep -nE '^(trafficStats|masquerade|bandwidth|acl|quic|resolver|outbounds):' "$stripped" | head -1 | cut -d: -f1 || true)"
-  if [[ -n "$insert_at" && "$insert_at" -gt 1 ]]; then
-    head -n "$((insert_at - 1))" "$stripped" > "$tmp"
-    emit_auth_block http "" "$url" "$insecure" >> "$tmp"
-    printf '\n' >> "$tmp"
-    tail -n "+$insert_at" "$stripped" >> "$tmp"
-  else
-    cat "$stripped" > "$tmp"
-    printf '\n' >> "$tmp"
-    emit_auth_block http "" "$url" "$insecure" >> "$tmp"
-  fi
-  rm -f "$stripped"
-
-  cp -a "$cfg" "$backup"
-  cat "$tmp" > "$cfg"
-  rm -f "$tmp"
-  chmod 600 "$cfg"
-
-  log "已把 auth 段换成 HTTP 鉴权：$url（insecure=$([[ "$insecure" == "1" ]] && echo true || echo false)）"
-  info "  备份：$backup"
-  info "  其余内容（证书 / masquerade / trafficStats）未改动"
-
-  if [[ "$HAS_SYSTEMD" -eq 1 ]]; then
-    units="$(systemctl list-unit-files 2>/dev/null || true)"
-    if grep -q "^$HY_SERVICE.service" <<<"$units"; then
-      systemctl restart "$HY_SERVICE" && log "已重启 $HY_SERVICE" \
-        || warn "重启 $HY_SERVICE 失败：配置已改，请手动检查（备份 $backup）"
-    else
-      warn "没找到 $HY_SERVICE.service：请手动重启 Hysteria"
-    fi
-  fi
-}
-
-# 确保 systemd 单元存在
+  # 确保 systemd 单元存在
   # NB: 不要写 `systemctl list-unit-files | grep -q ...`：set -o pipefail 下 grep 提前退出会让
   # systemctl 收到 SIGPIPE(141)，整条管道判为失败 → 明明有单元也会被当成「不存在」而重写它。
   unit_files=""

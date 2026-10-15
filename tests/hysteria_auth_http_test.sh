@@ -76,6 +76,10 @@ masquerade:
 YAML
 cp "${CFG}" "${WORK}/original.yaml"
 
+echo "== 0) 脚本自身语法"
+if bash -n "${ROOT}/install.sh"; then ok "install.sh 语法通过"; else bad "install.sh 语法错误"; fi
+if bash -n "${ROOT}/scripts/set-hysteria-auth-http.sh"; then ok "独立脚本语法通过"; else bad "独立脚本语法错误"; fi
+
 echo "== 1) 生成时默认就是 HTTP 鉴权（emit_auth_block）"
 gen="$(emit_auth_block http "" "https://auth.ipx.sarl" "0")"
 [[ "$(printf '%s\n' "$gen" | wc -l)" == "5" ]] && ok "HTTP 鉴权块 5 行" || bad "HTTP 鉴权块行数不对"
@@ -90,6 +94,44 @@ if grep -q 'AUTH_BLOCK="$(emit_auth_block' "${ROOT}/install.sh" && grep -qE '^\$
 else
   bad "生成路径没有复用 emit_auth_block（测试就失效了）"
 fi
+
+echo "== 1c) 两个函数必须在**调用点之前**定义（曾因此 command not found 直接中止）"
+def_emit="$(grep -nE '^emit_auth_block\(\)' "${ROOT}/install.sh" | head -1 | cut -d: -f1)"
+def_set="$(grep -nE '^set_hysteria_auth_http\(\)' "${ROOT}/install.sh" | head -1 | cut -d: -f1)"
+call_emit="$(grep -nE 'emit_auth_block \"' "${ROOT}/install.sh" | head -1 | cut -d: -f1)"
+call_set="$(grep -nE 'set_hysteria_auth_http \"' "${ROOT}/install.sh" | head -1 | cut -d: -f1)"
+if [[ -n "${def_emit}" && -n "${call_emit}" && "${def_emit}" -lt "${call_emit}" ]]; then
+  ok "emit_auth_block 定义(${def_emit}) 早于调用(${call_emit})"
+else
+  bad "emit_auth_block 定义/调用顺序不对（定义=${def_emit:-无} 调用=${call_emit:-无}）→ 运行时会 command not found"
+fi
+if [[ -n "${def_set}" && -n "${call_set}" && "${def_set}" -lt "${call_set}" ]]; then
+  ok "set_hysteria_auth_http 定义(${def_set}) 早于调用(${call_set})"
+else
+  bad "set_hysteria_auth_http 定义/调用顺序不对（定义=${def_set:-无} 调用=${call_set:-无}）"
+fi
+
+echo "== 1d) 按生成路径模拟一遍：heredoc 里必须是 5 行 HTTP 鉴权且后续键不丢"
+GEN="${WORK}/generated.yaml"
+HYSTERIA_AUTH_MODE=http
+HYSTERIA_AUTH_URL="https://auth.ipx.sarl"
+HYSTERIA_AUTH_INSECURE=0
+HY_PASSWORD="randompw"
+AUTH_BLOCK="$(emit_auth_block "$HYSTERIA_AUTH_MODE" "$HY_PASSWORD" "$HYSTERIA_AUTH_URL" "$HYSTERIA_AUTH_INSECURE")"
+cat > "${GEN}" <<EOF
+listen: :443
+$AUTH_BLOCK
+masquerade:
+  type: 404
+trafficStats:
+  listen: 127.0.0.1:8080
+  secret: deadbeef
+EOF
+grep -q "type: http" "${GEN}" && grep -q "url: https://auth.ipx.sarl" "${GEN}" && grep -q "insecure: false" "${GEN}" \
+  && ok "生成的配置带 HTTP 鉴权" || { bad "生成的配置缺 HTTP 鉴权"; cat "${GEN}" | sed 's/^/      /'; }
+grep -q "type: password" "${GEN}" && bad "生成的配置仍有静态密码" || ok "生成路径不含静态密码"
+grep -q "^masquerade:" "${GEN}" && grep -q "^trafficStats:" "${GEN}" \
+  && ok "auth 段之后的键没被吃掉" || bad "auth 段吃掉了后面的键"
 
 echo "== 2) password 模式仍可用（兼容老节点）"
 legacy="$(emit_auth_block password "deadbeefcafe" "" "0")"
