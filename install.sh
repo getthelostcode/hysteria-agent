@@ -99,6 +99,29 @@ fi
 [[ -n "$CONTROL_URL" ]] || die "第一个参数必须是控制面地址，例如: bash install.sh https://cp.example.com --token=xxx"
 CONTROL_URL="${CONTROL_URL%/}"
 
+# 令牌形状：在动任何东西之前判死。面板列表里显示的是 12 位掩码（enr_GmCVlx2W…），
+# 抄它注册一定失败，但会白白走完二进制安装 + 服务检查 + 配置生成，最后停在 401。
+if [[ -n "$ENROLL_TOKEN" ]]; then
+  TOKEN_TRIMMED="${ENROLL_TOKEN//[[:space:]]/}"
+  if [[ "$TOKEN_TRIMMED" != "${ENROLL_TOKEN}" ]]; then
+    ENROLL_TOKEN="$TOKEN_TRIMMED"
+    warn "注册令牌两端带有空白字符，已自动去掉"
+  fi
+  if [[ "$ENROLL_TOKEN" == enr_* && "${#ENROLL_TOKEN}" -ne 44 ]]; then
+    die "$(cat <<EOF
+注册令牌被截断了：当前 ${#ENROLL_TOKEN} 字符，本控制面签发的完整令牌是 44 字符（enr_ + 40 位随机字符）。
+  你给的是：${ENROLL_TOKEN}
+  面板「注册令牌」列表里显示的 enr_xxxxxxxxxx… 是**掩码前缀**（控制面只保存 SHA-256 哈希，无法反查明文）。
+  请到面板 → 注册令牌 → 该行点「重新签发」→「查看刚签发的令牌」→「复制完整令牌」，再重跑：
+    bash install.sh $CONTROL_URL --token='<粘贴 44 字符完整令牌>'
+EOF
+)"
+  fi
+  if [[ "$ENROLL_TOKEN" != enr_* ]]; then
+    warn "注册令牌不以 enr_ 开头（${#ENROLL_TOKEN} 字符）：若不是 hysteria-control-plane 签发的可忽略；否则请检查是否复制错了字段"
+  fi
+fi
+
 # ---------------------------------------------------------------- 工具函数
 write_file() { # write_file <path> <mode> ; 内容从 stdin 读
   local path="$1" mode="$2"

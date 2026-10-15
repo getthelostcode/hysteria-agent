@@ -210,6 +210,16 @@ func cmdEnroll(argv []string) int {
 		fmt.Fprintln(os.Stderr, "缺少控制面地址：用 --server=https://... 或在配置文件里设置 control.server_url")
 		return 2
 	}
+
+	// 令牌形状先本地判死：**在 TLS 预检和任何网络请求之前**。
+	// 面板列表里显示的是 12 位掩码（enr_GmCVlx2W…），抄它注册会白跑一趟 TLS+注册才拿到 401。
+	if !*checkOnly {
+		if err := enroll.ValidateTokenShape(*token); err != nil {
+			fmt.Fprintf(os.Stderr, "注册令牌无效：%v\n", err)
+
+			return 2
+		}
+	}
 	if err := cfg.Validate(); err != nil {
 		fmt.Fprintf(os.Stderr, "配置校验失败: %v\n", err)
 		return 1

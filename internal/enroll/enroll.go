@@ -74,8 +74,8 @@ func Run(ctx context.Context, cfg *config.Config, opt Options, logf func(format 
 	if logf == nil {
 		logf = func(string, ...any) {}
 	}
-	if strings.TrimSpace(opt.Token) == "" {
-		return nil, fmt.Errorf("enroll_token 不能为空（用法: hysteria-agent enroll --token=<token>）")
+	if err := ValidateTokenShape(opt.Token); err != nil {
+		return nil, err
 	}
 	if cfg.Control.ServerURL == "" {
 		return nil, fmt.Errorf("未配置 control.server_url，请先编辑 %s", cfg.Path)
