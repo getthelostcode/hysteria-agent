@@ -34,6 +34,31 @@ Hysteria2 节点的**管理守护进程**：一条 WebSocket + Protobuf 长连�
 * 控制面：**本仓库自带一份可直接上线的实现**（`bin/controlplane`，见下节）；也可以自己实现，只要满足 [DESIGN.md §5.1](DESIGN.md) 的三个接口（`cmd/mockcontrol` 是 200 行的最小参考实现）
 
 
+### Hysteria 鉴权：默认 HTTP，已有节点可单独换
+
+静态密码（`auth.type: password`）写在节点上，用户离开平台后依然能连，也没法按流量/到期回收。
+所以生成的配置默认走 **HTTP 鉴权**：
+
+```yaml
+auth:
+  type: http
+  http:
+    url: https://auth.ipx.sarl    # HYSTERIA_AUTH_URL
+    insecure: false               # HYSTERIA_AUTH_INSECURE=1 才跳过证书校验
+```
+
+* 新装：`install.sh` 生成配置时就用上面这段；想保留老行为设 `HYSTERIA_AUTH_MODE=password`。
+* **已有节点**：`install.sh` 默认**不动**已有配置（只读它的 trafficStats），要换鉴权必须显式：
+  ```bash
+  sudo bash scripts/set-hysteria-auth-http.sh https://auth.ipx.sarl   # 只改 auth 段，自动备份 + 重启
+  # 或 sudo bash install.sh https://node.ipx.sarl --set-hysteria-auth --hysteria-auth-url https://auth.ipx.sarl
+  ```
+  两种方式都只替换顶层 `auth` 段，证书 / `masquerade` / `trafficStats` 一字不动。
+  ⚠️ 切之前先确认鉴权后端可用，否则**所有用户都连不上**：
+  `curl -si -X POST -H 'Content-Type: application/json' -d '{"addr":"1.2.3.4:1","auth":"a:b","tx":0,"rx":0}' https://auth.ipx.sarl/auth`
+  → 期望 200 + `{"ok":false,"id":""}`。
+* 回归：`bash tests/hysteria_auth_http_test.sh`（30 项断言，含「两份实现输出一致」的防漂移断言）。
+
 ### 控制通道不可用时的 REST 兜底心跳
 
 控制通道是二进制 protobuf WebSocket；**Laravel/PHP 一类的控制面终结不了它**（返回 501）。
