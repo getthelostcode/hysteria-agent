@@ -182,7 +182,14 @@ check "dry-run 没落盘" "! grep -q 'marker: from-panel-v4' '$WORK/etc/hysteria
 "$WORK/bin/hysteria-agent" -config "$WORK/etc/agent/config.yaml" config sync >"$WORK/logs/sync5.log" 2>&1
 check "去掉 dry-run 后正常落盘" "grep -q 'marker: from-panel-v4' '$WORK/etc/hysteria/config.yaml'"
 
-log "7) 清理"
+log "7) 本机文件被手工改过/曾被拒绝 → 不能误报「已是最新」"
+printf '\n# 手工追加的一行\n' >> "$WORK/etc/hysteria/config.yaml"
+"$WORK/bin/hysteria-agent" -config "$WORK/etc/agent/config.yaml" config sync >"$WORK/logs/sync6.log" 2>&1
+check "明确说明本机与历史不一致" "grep -q '与任何历史记录都不一致' '$WORK/logs/sync6.log'"
+check "重新落盘（覆盖掉手工改动）" "! grep -q '手工追加的一行' '$WORK/etc/hysteria/config.yaml'"
+check "仍与面板一致" "grep -q 'marker: from-panel-v4' '$WORK/etc/hysteria/config.yaml'"
+
+log "8) 清理"
 panel delete_node "$NODE_ID" >/dev/null
 [[ -n "${TOKEN_ID:-}" ]] && panel revoke_token "$TOKEN_ID" >/dev/null
 

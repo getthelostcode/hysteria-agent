@@ -238,6 +238,32 @@ func (s *Store) ConfigHash() (string, error) {
 	return hex.EncodeToString(sum[:]), nil
 }
 
+// CurrentExact 只在目标配置文件与某条历史记录**逐字节一致**时返回它，否则返回 nil。
+//
+// 与 Current() 的区别：Current() 匹配不到就退回「最新一条记录」，于是被校验拒绝、
+// 从未真正落盘的版本也会被当成「本机当前版本」—— sync 会误报「已是最新」，
+// 节点再也取不到修复后的配置（jp8 上真踩过）。
+func (s *Store) CurrentExact() (*Version, error) {
+	cur, err := s.ConfigHash()
+	if err != nil {
+		return nil, err
+	}
+	if cur == "" {
+		return nil, nil
+	}
+	vs, err := s.List()
+	if err != nil {
+		return nil, err
+	}
+	for i := range vs {
+		if vs[i].SHA256 == cur && vs[i].Result != "rejected" && vs[i].Result != "failed" {
+			return &vs[i], nil
+		}
+	}
+
+	return nil, nil
+}
+
 // CurrentRevision 返回当前 revisions 字符串（找 hash 匹配的最新记录）。
 func (s *Store) CurrentRevision() string {
 	v, err := s.Current()

@@ -586,7 +586,21 @@ func syncConfig(cfgPath string, currentFlag int, force, dryRun, reload bool) int
 
 	current := currentFlag
 	if current < 0 {
-		current = leadingInt(store.CurrentRevision())
+		// 只有本机文件与某条历史记录逐字节一致时才算「本机是那一版」。
+		// 对不上（回滚过、被拒绝过、被手工改过）就按未知处理，重新去控制面取 ——
+		// 否则会误报「已是最新」，节点永远取不到修好的配置。
+		exact, err := store.CurrentExact()
+		switch {
+		case err != nil:
+			fmt.Fprintf(os.Stderr, "读取本机配置历史失败（按未知版本处理）: %v\n", err)
+		case exact != nil:
+			current = leadingInt(exact.Revision)
+		default:
+			current = 0
+			fmt.Fprintf(os.Stderr,
+				"本机 %s 与任何历史记录都不一致（被拒绝过/回滚过/手工改过）→ 按未知版本处理，重新取控制面最新配置\n",
+				cfg.Hysteria.ConfigPath)
+		}
 	}
 
 	ctx := context.Background()
