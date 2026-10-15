@@ -17,6 +17,18 @@ HY_API=18082
 AGENT_SERVICE=hysteria-agent-test
 REAL_CFG=/etc/hysteria/config.yaml
 
+# 工具二进制：优先 bin/（make tools），否则从 release/ 包里取（bare clone 也能跑）
+pick_tool() {
+  local name="$1" t
+  [[ -x "$ROOT/bin/$name" ]] && { echo "$ROOT/bin/$name"; return 0; }
+  for t in "$ROOT"/release/*/bin/"$name"; do
+    [[ -x "$t" ]] && { echo "$t"; return 0; }
+  done
+  return 1
+}
+MOCKCONTROL="$(pick_tool mockcontrol || true)"
+[[ -n "$MOCKCONTROL" ]] || { echo "找不到 mockcontrol：先 make tools，或解包 release/*.tar.gz"; exit 1; }
+
 PASS=0; FAIL=0
 ok()   { printf '\033[1;32m[PASS]\033[0m %s\n' "$*"; PASS=$((PASS+1)); }
 bad()  { printf '\033[1;31m[FAIL]\033[0m %s\n' "$*"; FAIL=$((FAIL+1)); }
@@ -42,7 +54,7 @@ log "准备隔离环境 $WORK"
 rm -rf "$WORK"; mkdir -p "$WORK"
 pkill -f "mockcontrol -listen 127.0.0.1:$CP_PORT" 2>/dev/null
 sleep 0.5
-setsid "$ROOT/bin/mockcontrol" -listen "127.0.0.1:$CP_PORT" -enroll-token install-test-token \
+setsid "$MOCKCONTROL" -listen "127.0.0.1:$CP_PORT" -enroll-token install-test-token \
   -dump "$WORK/dump.jsonl" > "$WORK/mock.log" 2>&1 < /dev/null &
 sleep 1
 
@@ -103,8 +115,8 @@ check "隔离实例的 trafficStats API 可读（200）" \
   bash -c "test \$(curl -s -o /dev/null -w '%{http_code}' -H 'Authorization: $TS_SECRET' http://127.0.0.1:$HY_API/traffic) = 200"
 check "负例：不带 secret 必须 401" \
   bash -c "test \$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:$HY_API/traffic) = 401"
-check "hysteria-agent status 可用" bash -c "'$ROOT/bin/hysteria-agent' status | grep -q node_id"
-check "hysteria-agent diag 通过" bash -c "'$ROOT/bin/hysteria-agent' diag >/dev/null || true"
+check "hysteria-agent status 可用" bash -c "/usr/local/bin/hysteria-agent status | grep -q node_id"
+check "hysteria-agent diag 通过" bash -c "/usr/local/bin/hysteria-agent diag >/dev/null || true"
 
 log "验证 --verify-only"
 AGENT_SERVICE="$AGENT_SERVICE" bash "$ROOT/install.sh" http://127.0.0.1:$CP_PORT --verify-only \

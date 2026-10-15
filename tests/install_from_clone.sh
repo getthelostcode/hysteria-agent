@@ -14,6 +14,18 @@ HY_API=18087
 AGENT_SERVICE=hysteria-agent-clonetest
 REAL_CFG=/etc/hysteria/config.yaml
 
+# 工具二进制（mockcontrol 等）：优先 bin/（make tools），否则从 release/ 包里取
+pick_tool() {
+  local name="$1" t
+  [[ -x "$ROOT/bin/$name" ]] && { echo "$ROOT/bin/$name"; return 0; }
+  for t in "$ROOT"/release/*/bin/"$name"; do
+    [[ -x "$t" ]] && { echo "$t"; return 0; }
+  done
+  return 1
+}
+MOCKCONTROL="$(pick_tool mockcontrol || true)"
+[[ -n "$MOCKCONTROL" ]] || { echo "找不到 mockcontrol：先 make tools，或解包 release/*.tar.gz"; exit 1; }
+
 PASS=0; FAIL=0
 ok()   { printf '\033[1;32m[PASS]\033[0m %s\n' "$*"; PASS=$((PASS+1)); }
 bad()  { printf '\033[1;31m[FAIL]\033[0m %s\n' "$*"; FAIL=$((FAIL+1)); }
@@ -39,7 +51,7 @@ check "clone 里有发布包 release/*.tar.gz" bash -c "ls '$CLONE_REPO'/release
 mkdir -p "$WORK"
 
 log "2) 起假控制面（工具从工作树拿，被测的是 install.sh）"
-"$ROOT/bin/mockcontrol" -listen "127.0.0.1:$CP_PORT" -enroll-token clone-test-token \
+"$MOCKCONTROL" -listen "127.0.0.1:$CP_PORT" -enroll-token clone-test-token \
   -dump "$WORK/dump.jsonl" > "$WORK/mock.log" 2>&1 &
 sleep 1
 check "假控制面就绪" curl -sf "http://127.0.0.1:$CP_PORT/healthz"
