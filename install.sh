@@ -68,6 +68,7 @@ NODE_NAME=""
 NO_HYSTERIA=0
 SKIP_ENROLL=0
 SYNC_CONFIG=1
+SYNC_STRICT=0
 VERIFY_ONLY=0
 UNINSTALL=0
 SET_HYSTERIA_AUTH=0
@@ -87,6 +88,7 @@ while [[ $# -gt 0 ]]; do
     --no-hysteria)      NO_HYSTERIA=1 ;;
     --skip-enroll)      SKIP_ENROLL=1 ;;
     --no-sync-config)   SYNC_CONFIG=0 ;;
+    --strict-sync-config) SYNC_STRICT=1 ;;
     --verify-only)      VERIFY_ONLY=1 ;;
     --uninstall)        UNINSTALL=1 ;;
     -h|--help)          sed -n '2,40p' "$0"; exit 0 ;;
@@ -711,12 +713,20 @@ fi
 # 写入前一定会校验：不过就保持现有 $HY_CFG 不动 —— 宁可不同步，也不能把能用的配置换坏。
 # 用 --no-sync-config 可跳过；控制面不可达/还没发布过配置时会明确说明原因，不算安装失败。
 if [[ "$SYNC_CONFIG" == "1" && -f "$AGENT_CFG_DIR/credentials.json" ]]; then
-  info "步骤 5/6：把控制面上的最新配置同步到 $HY_CFG"
-  if "$AGENT_BIN" -config "$AGENT_CFG" config sync; then
+  info "步骤 5/6：把控制面上的最新配置同步到 $HY_CFG（以面板为准）"
+  SYNC_ARGS=()
+  [[ "$SYNC_STRICT" == "1" ]] && SYNC_ARGS+=(--strict)
+  SYNC_LOG="$(mktemp)"
+  if "$AGENT_BIN" -config "$AGENT_CFG" config sync "${SYNC_ARGS[@]}" 2>&1 | tee "$SYNC_LOG"; then
     log "配置已同步（历史与回滚：$AGENT_BIN config history -config $AGENT_CFG）"
+    if grep -q "按「面板为准」仍会写入" "$SYNC_LOG"; then
+      warn "写入的配置有校验问题（见上）。重启后请确认 Hysteria 是否正常："
+      warn "  systemctl status $HY_SERVICE；异常时回退：$AGENT_BIN config rollback -config $AGENT_CFG"
+    fi
   else
-    warn "配置同步未完成（控制面不可达 / 还没有已发布的配置 / 新配置没通过校验）—— 保留现有 $HY_CFG 不动"
+    warn "配置同步未完成（控制面不可达 / 还没有已发布的配置 / 配置无法解析）—— 保留现有 $HY_CFG 不动"
   fi
+  rm -f "$SYNC_LOG"
 elif [[ "$SYNC_CONFIG" == "0" ]]; then
   info "步骤 5/6：按 --no-sync-config 跳过配置同步"
 else

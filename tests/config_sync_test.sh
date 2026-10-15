@@ -155,7 +155,7 @@ sleep 1
 grep -q "已是最新" "$WORK/logs/sync2.log" && ok "识别为已是最新" || bad "没有识别为已是最新：$(cat "$WORK/logs/sync2.log")"
 [[ "$(stat -c %Y "$WORK/etc/hysteria/config.yaml")" == "$BEFORE" ]] && ok "文件没被重复写" || bad "文件被重复写了"
 
-log "5) 坏配置（面板能发布、节点装不了）→ 校验不过就不写"
+log "5) 面板为准：配置有问题（证书不存在）也照写，但把问题摊开讲"
 BAD_YAML="listen: 127.0.0.1:18455
 tls:
   cert: $WORK/certs/nope.crt
@@ -164,9 +164,25 @@ tls:
 "
 panel publish "$NODE_ID" "$BAD_YAML" "config-sync 坏配置" >/dev/null
 "$WORK/bin/hysteria-agent" -config "$WORK/etc/agent/config.yaml" config sync >"$WORK/logs/sync3.log" 2>&1
-[[ $? -ne 0 ]] && ok "坏配置被拒（非 0 退出）" || bad "坏配置竟然同步成功"
-check "坏配置没落盘" "! grep -q 'marker: from-panel-bad' '$WORK/etc/hysteria/config.yaml'"
-check "仍是上一份可用配置" "grep -q 'marker: from-panel-v1' '$WORK/etc/hysteria/config.yaml'"
+SYNC3=$?
+[[ "$SYNC3" == "0" ]] && ok "面板为准：仍然写入并成功退出" || { bad "sync 非 0 退出：$(cat "$WORK/logs/sync3.log")"; }
+check "明确说了「面板为准」" "grep -q '按「面板为准」仍会写入' '$WORK/logs/sync3.log'"
+check "列出了问题原因" "grep -q '无法加载' '$WORK/logs/sync3.log'"
+check "坏配置确实落盘了（面板是权威）" "grep -q 'marker: from-panel-bad' '$WORK/etc/hysteria/config.yaml'"
+check "写前留了快照（可回滚）" "ls '$WORK/etc/hysteria/history' | grep -q rev-"
+
+log "5b) --strict：想严格把关时恢复「校验不过就不写」"
+BAD2_YAML="listen: 127.0.0.1:18457
+tls:
+  cert: $WORK/certs/nope2.crt
+  key: $WORK/certs/nope2.key
+# marker: from-panel-bad2
+"
+panel publish "$NODE_ID" "$BAD2_YAML" "config-sync 坏配置2" >/dev/null
+"$WORK/bin/hysteria-agent" -config "$WORK/etc/agent/config.yaml" config sync --strict >"$WORK/logs/sync3b.log" 2>&1
+[[ $? -ne 0 ]] && ok "--strict 下被拒（非 0 退出）" || bad "--strict 竟然写入了"
+check "被拒时文件保持不动" "! grep -q 'marker: from-panel-bad2' '$WORK/etc/hysteria/config.yaml'"
+check "仍是上一次写下的内容" "grep -q 'marker: from-panel-bad' '$WORK/etc/hysteria/config.yaml'"
 
 log "6) dry-run 不落盘"
 V4_YAML="listen: 127.0.0.1:18456

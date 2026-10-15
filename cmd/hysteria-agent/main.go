@@ -572,7 +572,7 @@ func storeVersion(ctx context.Context, bin string) string {
 //     （agent 侧会硬校验 trafficStats.secret 与证书路径，宁可不同步也不能把能用的配置换坏）。
 //
 // install.sh 的第 5 步与运维手工都用它；`--dry-run` 只看不写，`--reload` 顺带重启被守护的 Hysteria。
-func syncConfig(cfgPath string, force, dryRun, reload bool) int {
+func syncConfig(cfgPath string, force, strict, dryRun, reload bool) int {
 	cfg, err := loadOrInitConfig(cfgPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "加载配置失败: %v\n", err)
@@ -624,21 +624,47 @@ func syncConfig(cfgPath string, force, dryRun, reload bool) int {
 		return 0
 	}
 
-	// 校验：不过就不写，并说清楚差在哪（面板写的值常与节点现状不符）。
+	// 校验：结果决定「能不能写」和「要不要提醒」，不决定「要不要听面板的」。
+	// 面板是配置的唯一权威 —— 它发了什么，节点就应当是什么；校验问题只作警告。
+	// 唯一的硬底线是语法：解析不出配置的东西写下去只会让 Hysteria 起不来。
 	res := hyconfig.Validate(ctx, payload, "yaml", hyconfig.ValidateOptions{
 		CheckPort: true, CheckCert: true, CertWarnDays: cfg.Hysteria.CertWarnDays,
 		RequireTrafficStats: false, ExpectedTrafficSecret: cfg.Hysteria.APISecret,
 		HysteriaBinary: cfg.Hysteria.Binary,
 	})
-	if !res.Valid {
+
+	applyable := res.Parsed != nil
+
+	if !applyable {
 		b, _ := json.MarshalIndent(res, "", "  ")
-		fmt.Fprintf(os.Stderr, "控制面 v%d 的配置没通过校验，未写入（本机 %s 保持不变）：\n%s\n",
+		fmt.Fprintf(os.Stderr, "控制面 v%d 的配置无法解析出配置内容，未写入（本机 %s 保持不变）：\n%s\n",
 			rc.Version, cfg.Hysteria.ConfigPath, string(b))
 
 		if !force {
 			return 1
 		}
 		fmt.Fprintln(os.Stderr, "（--force：仍按你的要求写入）")
+	}
+
+	if !res.Valid && applyable {
+		if strict {
+			b, _ := json.MarshalIndent(res, "", "  ")
+			fmt.Fprintf(os.Stderr, "控制面 v%d 的配置没通过校验，按 --strict 未写入（本机 %s 保持不变）：\n%s\n",
+				rc.Version, cfg.Hysteria.ConfigPath, string(b))
+
+			return 1
+		}
+
+		// 面板为准：照写，但把问题明明白白摊开（这些正是导致「发了没生效」的常见原因）。
+		fmt.Fprintf(os.Stderr, "注意：控制面 v%d 的配置有以下问题，按「面板为准」仍会写入 %s：\n",
+			rc.Version, cfg.Hysteria.ConfigPath)
+		for _, e := range res.Errors {
+			fmt.Fprintf(os.Stderr, "  - %s\n", e)
+		}
+		for _, w := range res.Warnings {
+			fmt.Fprintf(os.Stderr, "  · %s\n", w)
+		}
+		fmt.Fprintln(os.Stderr, "  写完后若不生效：hysteria-agent restart；要回退：hysteria-agent config rollback")
 	}
 
 	if dryRun {
@@ -678,6 +704,9 @@ func syncConfig(cfgPath string, force, dryRun, reload bool) int {
 
 	fmt.Printf("已同步控制面 v%d（sha256=%s）→ %s\n", rc.Version, want, path)
 	fmt.Printf("历史快照: rev=%s（回滚：hysteria-agent config rollback -config %s）\n", snap.Revision, cfgPath)
+	if !reload {
+		fmt.Println("提示：让新配置生效 —— systemctl restart hysteria-agent（或加 --reload 让本命令顺带重启 Hysteria）")
+	}
 
 	if reload {
 		if cfg.Hysteria.Mode != "systemd" {
@@ -757,12 +786,13 @@ func cmdConfig(argv []string) int {
 	case "sync":
 		fs := flag.NewFlagSet("config sync", flag.ExitOnError)
 		cfgPath := fs.String("config", config.DefaultConfigPath, "agent 配置文件路径")
-		force := fs.Bool("force", false, "校验未通过也写入（不建议）")
+		force := fs.Bool("force", false, "连语法都不合法也照写（不建议）")
+		strict := fs.Bool("strict", false, "校验不通过就不写（默认「面板为准」：仍写入，问题作为警告打印）")
 		dryRun := fs.Bool("dry-run", false, "只拉取并打印，不落盘")
 		reload := fs.Bool("reload", false, "写完后重启被守护的 Hysteria 服务")
 		_ = fs.Parse(argv[1:])
 
-		return syncConfig(*cfgPath, *force, *dryRun, *reload)
+		return syncConfig(*cfgPath, *force, *strict, *dryRun, *reload)
 
 	case "validate":
 		fs := flag.NewFlagSet("config validate", flag.ExitOnError)
