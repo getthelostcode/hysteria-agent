@@ -23,6 +23,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -31,6 +32,7 @@ import (
 
 	"github.com/getthelostcode/hysteria-agent/internal/agent"
 	"github.com/getthelostcode/hysteria-agent/internal/config"
+	"github.com/getthelostcode/hysteria-agent/internal/control"
 	"github.com/getthelostcode/hysteria-agent/internal/creds"
 	"github.com/getthelostcode/hysteria-agent/internal/diag"
 	"github.com/getthelostcode/hysteria-agent/internal/enroll"
@@ -560,12 +562,183 @@ func storeVersion(ctx context.Context, bin string) string {
 
 // ---------------------------- config ----------------------------
 
+// syncConfig 把控制面上最新发布的配置同步到本机。
+//
+// 为什么要有它：`install.sh` 跑完就该让 VPS 立刻用上面板里的配置，而不是等 agent 起来轮询；
+// 同时这也是运维「现在就同步」的一条命令。写入前一律先校验 + 存历史快照，
+// 校验不过就保持现有文件不动（宁可不同步，也不能把能用的配置换坏）。
+func syncConfig(cfgPath string, currentFlag int, force, dryRun, reload bool) int {
+	cfg, err := loadOrInitConfig(cfgPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "加载配置失败: %v\n", err)
+
+		return 1
+	}
+
+	cr, err := creds.Load(cfg.CredentialsFile)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "读取凭据失败（%s）：先跑 enroll 注册本节点\n", cfg.CredentialsFile)
+
+		return 1
+	}
+
+	store := hyconfig.NewStore(cfg.Hysteria.HistoryDir, cfg.Hysteria.ConfigPath, cfg.Hysteria.HistoryKeep)
+
+	current := currentFlag
+	if current < 0 {
+		current = leadingInt(store.CurrentRevision())
+	}
+
+	ctx := context.Background()
+
+	rc, err := control.FetchLatestConfig(ctx, cfg, cr, current)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "从控制面拉取配置失败: %v\n", err)
+
+		return 1
+	}
+
+	if rc.UpToDate || strings.TrimSpace(rc.Content) == "" {
+		fmt.Printf("已是最新配置（本机 v%d，控制面没有更新的版本），未改动 %s\n", current, cfg.Hysteria.ConfigPath)
+
+		return 0
+	}
+
+	payload := []byte(rc.Content)
+
+	// 校验：不过就不写。默认严格，--force 才放行（面板模板写错时别把节点弄挂）。
+	res := hyconfig.Validate(ctx, payload, "yaml", hyconfig.ValidateOptions{
+		CheckPort: true, CheckCert: true, CertWarnDays: cfg.Hysteria.CertWarnDays,
+		RequireTrafficStats: false, ExpectedTrafficSecret: cfg.Hysteria.APISecret,
+		HysteriaBinary: cfg.Hysteria.Binary,
+	})
+	if !res.Valid {
+		b, _ := json.MarshalIndent(res, "", "  ")
+		fmt.Fprintf(os.Stderr, "控制面 v%d 的配置没通过校验，未写入：\n%s\n", rc.Version, string(b))
+
+		if !force {
+			return 1
+		}
+		fmt.Fprintln(os.Stderr, "（--force：仍按你的要求写入）")
+	}
+
+	if dryRun {
+		b, _ := json.MarshalIndent(res, "", "  ")
+		fmt.Printf("--dry-run：控制面 v%d sha256=%s（%d 字节），校验结果：\n%s\n", rc.Version, rc.SHA256, len(payload), string(b))
+
+		return 0
+	}
+
+	snap, err := store.Snapshot(payload, rc.Revision, "yaml", "control-plane-sync", fmt.Sprintf("面板下发 v%d", rc.Version))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "保存配置快照失败: %v\n", err)
+
+		return 1
+	}
+	// Snapshot 只写快照文件，索引要单独记：没有索引，下次就认不出「当前是哪一版」，
+	// 于是每次 sync 都重写一遍（第一次写就踩了这个坑）。
+	if err := store.Record(*snap); err != nil {
+		fmt.Fprintf(os.Stderr, "记录配置历史失败: %v\n", err)
+
+		return 1
+	}
+	path, err := store.Apply(payload)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "写入 %s 失败: %v\n", cfg.Hysteria.ConfigPath, err)
+
+		return 1
+	}
+	if _, err := store.Prune(); err != nil {
+		fmt.Fprintf(os.Stderr, "清理旧快照失败（不影响本次同步）: %v\n", err)
+	}
+
+	fmt.Printf("已同步控制面 v%d（sha256=%s）→ %s\n", rc.Version, rc.SHA256, path)
+	fmt.Printf("历史快照: rev=%s（回滚：hysteria-agent config rollback -config %s）\n", snap.Revision, cfgPath)
+
+	if reload {
+		if cfg.Hysteria.Mode != "systemd" {
+			fmt.Printf("hysteria.mode=%s：配置已就绪，重启 hysteria-agent 服务即可让它生效\n", cfg.Hysteria.Mode)
+
+			return 0
+		}
+		if _, err := exec.LookPath("systemctl"); err != nil {
+			fmt.Fprintln(os.Stderr, "本机没有 systemctl，无法自动重启 Hysteria")
+
+			return 1
+		}
+		if out, err := exec.Command("systemctl", "try-restart", cfg.Hysteria.ServiceName).CombinedOutput(); err != nil {
+			fmt.Fprintf(os.Stderr, "systemctl try-restart %s 失败: %v (%s)\n", cfg.Hysteria.ServiceName, err, strings.TrimSpace(string(out)))
+
+			return 1
+		}
+		fmt.Printf("已重启 %s\n", cfg.Hysteria.ServiceName)
+	}
+
+	return 0
+}
+
+// normalizeConfigArgs 把 -config/-c 从任意位置提到前面，便于按 argv[0] 分发子命令。
+func normalizeConfigArgs(argv []string) []string {
+	var pre, rest []string
+	for i := 0; i < len(argv); i++ {
+		a := argv[i]
+		switch {
+		case a == "-config" || a == "--config" || a == "-c":
+			pre = append(pre, a)
+			if i+1 < len(argv) {
+				pre = append(pre, argv[i+1])
+				i++
+			}
+		case strings.HasPrefix(a, "-config=") || strings.HasPrefix(a, "--config="):
+			pre = append(pre, a)
+		default:
+			rest = append(rest, a)
+		}
+	}
+
+	// 子命令必须在最前（argv[0] 用来分发），flag 都塞回它后面。
+	return append(rest, pre...)
+}
+
+// leadingInt 取字符串开头的整数（版本号可能是 "6" 这类），取不到返回 0。
+func leadingInt(s string) int {
+	s = strings.TrimSpace(s)
+	end := 0
+	for end < len(s) && s[end] >= '0' && s[end] <= '9' {
+		end++
+	}
+	if end == 0 {
+		return 0
+	}
+	n, err := strconv.Atoi(s[:end])
+	if err != nil {
+		return 0
+	}
+
+	return n
+}
+
 func cmdConfig(argv []string) int {
+	// main 允许把 -config 写在子命令之前（`hysteria-agent -config x config sync`），
+	// 而这里按 argv[0] 分发子命令 —— 先把 -config 归位，两种写法都能用。
+	argv = normalizeConfigArgs(argv)
+
 	if len(argv) == 0 {
 		fmt.Fprintln(os.Stderr, "用法: hysteria-agent config <validate|history|rollback>")
 		return 2
 	}
 	switch argv[0] {
+	case "sync":
+		fs := flag.NewFlagSet("config sync", flag.ExitOnError)
+		cfgPath := fs.String("config", config.DefaultConfigPath, "agent 配置文件路径")
+		current := fs.Int("current-version", -1, "本机已应用的配置版本（默认从历史推断）")
+		force := fs.Bool("force", false, "校验未通过也写入（不建议）")
+		dryRun := fs.Bool("dry-run", false, "只拉取并打印，不落盘")
+		reload := fs.Bool("reload", false, "写完后重启被守护的 Hysteria 服务")
+		_ = fs.Parse(argv[1:])
+
+		return syncConfig(*cfgPath, *current, *force, *dryRun, *reload)
+
 	case "validate":
 		fs := flag.NewFlagSet("config validate", flag.ExitOnError)
 		file := fs.String("f", "", "待校验的 Hysteria 配置文件")

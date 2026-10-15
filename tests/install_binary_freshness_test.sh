@@ -75,11 +75,14 @@ export GO="${WORK}/bin/go"
 export SCRIPT_DIR="${REPO}"
 
 echo "== 1) 过期判定"
+# 把全部 .go 的 mtime 固定下来（否则测试自己创建文件的时间会让断言随运行时刻飘）
+find "${REPO}" -name '*.go' -exec touch -d '2026-10-15 12:00:00' {} +
 touch -d '2026-10-15 15:00:00' "${REPO}/internal/version/version.go"
 touch -d '2026-10-15 12:52:00' "${OLD}"
 if agent_binary_stale "${OLD}"; then ok "源码比二进制新 → 判为过期"; else bad "应该判为过期却没判"; fi
 
 echo "== 2) 二进制比源码新（刚构建过的检出）→ 不该重建"
+find "${REPO}" -name '*.go' -exec touch -d '2026-10-15 15:00:00' {} +
 touch -d '2026-10-15 16:00:00' "${OLD}"
 if agent_binary_stale "${OLD}"; then bad "不该判为过期"; else ok "二进制更新 → 不重建"; fi
 touch -d '2026-10-15 12:52:00' "${OLD}"

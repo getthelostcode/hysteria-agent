@@ -34,6 +34,31 @@ Hysteria2 节点的**管理守护进程**：一条 WebSocket + Protobuf 长连�
 * 控制面：**本仓库自带一份可直接上线的实现**（`bin/controlplane`，见下节）；也可以自己实现，只要满足 [DESIGN.md §5.1](DESIGN.md) 的三个接口（`cmd/mockcontrol` 是 200 行的最小参考实现）
 
 
+### 装完/更新完立刻用上面板里的配置
+
+`install.sh` 第 5 步会跑 `hysteria-agent config sync`：把控制面上**最新发布的**配置直接同步到
+`hysteria.config_path`（默认 `/etc/hysteria/config.yaml`），不用等 agent 起来轮询。
+
+```bash
+sudo -E bash install.sh https://node.ipx.sarl --skip-enroll   # 升级 agent 的同时把配置拉到最新
+```
+
+* 面板还没发布过配置 / 已是最新 → 明确说明并**不动**本地文件；
+* 新配置**先校验再写**：不过就保持现有文件不动（宁可不同步，也不能把能用的配置换坏），
+  写入前会存历史快照，回滚：`hysteria-agent config history|rollback`；
+* 控制面不可达不会让安装失败，只 WARN；
+* 不想同步：`--no-sync-config`；
+* 运维手工同步（先看会写什么）：
+
+```bash
+hysteria-agent config sync --dry-run     # 只拉取 + 校验 + 打印
+hysteria-agent config sync               # 落盘（0600，原子写，留历史）
+hysteria-agent config sync --reload      # 落盘后顺带重启被守护的 Hysteria（mode: systemd）
+```
+
+回归：`bash tests/install_sync_e2e.sh`（16 项断言，跑**真的 install.sh**：装完→发布新版本→再跑一次→
+磁盘自动跟上；`--no-sync-config` 跳过；已是最新不重复写）。
+
 ### 更新节点：装到的必须是新构建
 
 `install.sh` 优先用仓库里入库的发布产物 `dist/hysteria-agent-linux-<arch>`。**只 `git pull` 不会更新它**，

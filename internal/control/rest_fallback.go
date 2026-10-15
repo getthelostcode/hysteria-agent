@@ -16,6 +16,7 @@ import (
 
 	"github.com/getthelostcode/hysteria-agent/gen/agentpb"
 	"github.com/getthelostcode/hysteria-agent/internal/config"
+	"github.com/getthelostcode/hysteria-agent/internal/creds"
 	"github.com/getthelostcode/hysteria-agent/internal/version"
 )
 
@@ -284,83 +285,109 @@ type restConfigLatest struct {
 	} `json:"config"`
 }
 
+// LatestConfig 是控制面 GET rest_config_path 的响应（REST 通道的配置下发）。
+type LatestConfig struct {
+	UpToDate bool
+	Version  int
+	Revision string
+	SHA256   string
+	Content  string
+}
+
+const defaultRESTConfigPath = "/api/v1/agent/config/latest"
+
+// FetchLatestConfig 从控制面拉最新配置。
+//
+// 守护进程的兜底轮询与 CLI 的 `hysteria-agent config sync` 共用这一份实现：
+// 鉴权（node_secret 自签 JWT）、TLS/pinning、错误处理都不该有两份，否则迟早分叉。
+func FetchLatestConfig(ctx context.Context, cfg *config.Config, cr *creds.Credentials, currentVersion int) (*LatestConfig, error) {
+	path := cfg.Control.RESTConfigPath
+	if path == "" {
+		path = defaultRESTConfigPath
+	}
+
+	url := fmt.Sprintf("%s?current_version=%d", cfg.ControlHTTPURL(path), currentVersion)
+
+	reqCtx, cancel := context.WithTimeout(ctx, cfg.Control.ConnectTimeout())
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Accept", "application/json")
+	if err := cr.Apply(req, &cfg.Control); err != nil {
+		return nil, err
+	}
+	if cr.NodeID != "" {
+		req.Header.Set("X-Node-ID", cr.NodeID)
+	}
+
+	resp, err := (&http.Client{Timeout: cfg.Control.ConnectTimeout()}).Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
+	if resp.StatusCode >= 400 {
+		return nil, fmt.Errorf("拉取配置被拒: HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(raw)))
+	}
+
+	var payload restConfigLatest
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		return nil, fmt.Errorf("解析控制面响应失败: %w", err)
+	}
+
+	out := &LatestConfig{UpToDate: payload.UpToDate}
+	if payload.Config != nil {
+		out.Version = payload.Config.Version
+		out.Revision = payload.Config.Revision
+		out.SHA256 = payload.Config.SHA256
+		out.Content = payload.Config.ContentYAML
+		if out.Revision == "" && out.Version > 0 {
+			out.Revision = strconv.Itoa(out.Version)
+		}
+	}
+
+	return out, nil
+}
+
 // pollRESTConfig 拉一次配置；有新版本就交给 agent 的应用管线（校验→原子写→热重载→失败回滚），
 // 回执由 Enqueue 走 REST 发回（见 Enqueue 里的 config_ack 分支）。
 //
 // 为什么要它：本控制面终结不了二进制 WS，配置下发只能走 REST；否则面板「发布配置」写进库
 // 就再无下文 —— 真实现场：库里所有配置都是 published、applied_at 为空。
 func (c *Client) pollRESTConfig(ctx context.Context) {
-	path := c.cfg.Control.RESTConfigPath
-	if path == "" {
-		path = "/api/v1/agent/config/latest"
-	}
-
 	c.mu.Lock()
 	current := c.restConfigVersion
 	c.mu.Unlock()
 
-	url := fmt.Sprintf("%s?current_version=%d", c.cfg.ControlHTTPURL(path), current)
-
-	reqCtx, cancel := context.WithTimeout(ctx, c.cfg.Control.ConnectTimeout())
-	defer cancel()
-
-	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, url, nil)
-	if err != nil {
-		return
-	}
-	req.Header.Set("Accept", "application/json")
-	if err := c.cr.Apply(req, &c.cfg.Control); err != nil {
-		return
-	}
-	if c.cr.NodeID != "" {
-		req.Header.Set("X-Node-ID", c.cr.NodeID)
-	}
-
-	resp, err := (&http.Client{Timeout: c.cfg.Control.ConnectTimeout()}).Do(req)
+	rc, err := FetchLatestConfig(ctx, c.cfg, c.cr, current)
 	if err != nil {
 		c.m.RESTConfigFailures.Inc()
-
-		return
-	}
-	defer func() { _ = resp.Body.Close() }()
-
-	if resp.StatusCode >= 400 {
-		c.m.RESTConfigFailures.Inc()
-		c.log.Warn("REST 拉取配置被拒", "status", resp.StatusCode, "path", path)
+		c.log.Warn("REST 拉取配置失败", "error", err.Error())
 
 		return
 	}
 
-	var payload restConfigLatest
-	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
-		c.m.RESTConfigFailures.Inc()
-
+	if rc.UpToDate || strings.TrimSpace(rc.Content) == "" {
 		return
-	}
-
-	if payload.UpToDate || payload.Config == nil || strings.TrimSpace(payload.Config.ContentYAML) == "" {
-		return
-	}
-
-	cfg := payload.Config
-	revision := cfg.Revision
-	if revision == "" {
-		revision = strconv.Itoa(cfg.Version)
 	}
 
 	c.m.RESTConfigPolls.Inc()
-	c.log.Info("REST 兜底：收到新配置", "version", cfg.Version, "revision", revision, "sha256", cfg.SHA256)
+	c.log.Info("REST 兜底：收到新配置", "version", rc.Version, "revision", rc.Revision, "sha256", rc.SHA256)
 
 	// 先记账再应用：应用失败时面板会生成更高版本的回滚配置，下一次轮询会取到它。
 	c.mu.Lock()
-	c.restConfigVersion = cfg.Version
+	c.restConfigVersion = rc.Version
 	c.mu.Unlock()
 
 	c.h.HandleConfigPush(ctx, &agentpb.ConfigPush{
-		Revision: revision,
+		Revision: rc.Revision,
 		Format:   "yaml",
-		Payload:  []byte(cfg.ContentYAML),
-		Sha256:   cfg.SHA256,
+		Payload:  []byte(rc.Content),
+		Sha256:   rc.SHA256,
 		Reason:   "rest-fallback",
 	})
 }

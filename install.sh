@@ -40,15 +40,15 @@
 set -euo pipefail
 
 # ---------------------------------------------------------------- 常量与日志
-AGENT_BIN=/usr/local/bin/hysteria-agent
-AGENT_CFG_DIR=/etc/hysteria-agent
+AGENT_BIN="${AGENT_BIN:-/usr/local/bin/hysteria-agent}"
+AGENT_CFG_DIR="${AGENT_CFG_DIR:-/etc/hysteria-agent}"
 AGENT_CFG=$AGENT_CFG_DIR/config.yaml
-AGENT_STATE=/var/lib/hysteria-agent
+AGENT_STATE="${AGENT_STATE:-/var/lib/hysteria-agent}"
 AGENT_SERVICE="${AGENT_SERVICE:-hysteria-agent}"
 HY_SERVICE="${HYSTERIA_SERVICE:-hysteria-server}"
 HY_LISTEN="${HYSTERIA_LISTEN:-:443}"
 HY_VERSION="${HYSTERIA_VERSION:-v2.6.5}"
-HY_CFG="/etc/hysteria/config.yaml"
+HY_CFG="${HYSTERIA_CONFIG:-/etc/hysteria/config.yaml}"
 # HTTP 鉴权是默认：静态密码写在节点上，用户离开平台后依然能连，也无法按流量/到期回收。
 HYSTERIA_AUTH_MODE="${HYSTERIA_AUTH_MODE:-http}"
 [[ -n "${HYSTERIA_AUTH_URL:-}" ]] && HYSTERIA_AUTH_URL_PROVIDED=1
@@ -67,6 +67,7 @@ ENROLL_TOKEN="${ENROLL_TOKEN:-}"
 NODE_NAME=""
 NO_HYSTERIA=0
 SKIP_ENROLL=0
+SYNC_CONFIG=1
 VERIFY_ONLY=0
 UNINSTALL=0
 SET_HYSTERIA_AUTH=0
@@ -85,6 +86,7 @@ while [[ $# -gt 0 ]]; do
     --hysteria-auth-insecure) HYSTERIA_AUTH_INSECURE=1 ;;
     --no-hysteria)      NO_HYSTERIA=1 ;;
     --skip-enroll)      SKIP_ENROLL=1 ;;
+    --no-sync-config)   SYNC_CONFIG=0 ;;
     --verify-only)      VERIFY_ONLY=1 ;;
     --uninstall)        UNINSTALL=1 ;;
     -h|--help)          sed -n '2,40p' "$0"; exit 0 ;;
@@ -352,7 +354,7 @@ if [[ $VERIFY_ONLY -eq 1 ]]; then
 fi
 
 # ---------------------------------------------------------------- 1. 安装 Agent 二进制
-info "步骤 1/5：安装 hysteria-agent 二进制"
+info "步骤 1/6：安装 hysteria-agent 二进制"
 if [[ -x "$AGENT_BIN" ]]; then
   info "已存在 $AGENT_BIN（将覆盖为新版本；旧文件备份为 $AGENT_BIN.bak）"
 fi
@@ -459,7 +461,7 @@ chmod 700 "$AGENT_CFG_DIR"; chmod 750 "$AGENT_STATE"
 
 # ---------------------------------------------------------------- 2. 确保 Hysteria 服务端
 if [[ $NO_HYSTERIA -eq 0 ]]; then
-  info "步骤 2/5：检查 Hysteria 服务端"
+  info "步骤 2/6：检查 Hysteria 服务端"
   if ! command -v hysteria >/dev/null 2>&1 && [[ ! -x /usr/local/bin/hysteria ]]; then
     warn "未找到 hysteria 二进制，尝试从 GitHub Releases 下载 $HY_VERSION"
     ARCH="$(detect_arch)"
@@ -561,11 +563,11 @@ EOF
     systemctl enable --now "$HY_SERVICE" >/dev/null 2>&1 || warn "启动 $HY_SERVICE 失败，请查看 journalctl -u $HY_SERVICE"
   fi
 else
-  info "步骤 2/5：跳过 Hysteria（--no-hysteria）"
+  info "步骤 2/6：跳过 Hysteria（--no-hysteria）"
 fi
 
 # ---------------------------------------------------------------- 3. 生成 Agent 配置
-info "步骤 3/5：生成 $AGENT_CFG"
+info "步骤 3/6：生成 $AGENT_CFG"
 # 从 Hysteria 配置里读 trafficStats（Agent 必须用同一个 secret 才能读流量/踢人）
 TS_LISTEN="$(awk '/trafficStats:/{f=1} f&&/listen:/{sub(/^[[:space:]]*listen:[[:space:]]*/,"");gsub(/["'"'"']/,"");print;exit}' "$HY_CFG" 2>/dev/null || true)"
 TS_SECRET="$(awk '/trafficStats:/{f=1} f&&/secret:/{sub(/^[[:space:]]*secret:[[:space:]]*/,"");gsub(/["'"'"']/,"");print;exit}' "$HY_CFG" 2>/dev/null || true)"
@@ -650,7 +652,7 @@ EOF
 log "已写入 $AGENT_CFG（api_base_url=$API_BASE, api_secret=$([[ -n $TS_SECRET ]] && echo '已对齐' || echo '缺失'))"
 
 # ---------------------------------------------------------------- 4. systemd + enroll
-info "步骤 4/5：安装 systemd 单元"
+info "步骤 4/6：安装 systemd 单元"
 if [[ $HAS_SYSTEMD -eq 1 ]]; then
   UNIT_SRC="$SCRIPT_DIR/deploy/$AGENT_SERVICE.service"
   [[ -f "$UNIT_SRC" ]] || UNIT_SRC="$SCRIPT_DIR/deploy/hysteria-agent.service"
@@ -704,6 +706,23 @@ if [[ ! -f "$AGENT_CFG_DIR/credentials.json" && $SKIP_ENROLL -eq 0 ]]; then
   fi
 fi
 
+# ---------------------------------------------------------------- 5. 同步面板配置
+# 装/升级完就应当让节点用上面板里**最新发布的**配置，而不是等 agent 起来轮询（更不是一直用旧文件）。
+# 写入前一定会校验：不过就保持现有 $HY_CFG 不动 —— 宁可不同步，也不能把能用的配置换坏。
+# 用 --no-sync-config 可跳过；控制面不可达/还没发布过配置时会明确说明原因，不算安装失败。
+if [[ "$SYNC_CONFIG" == "1" && -f "$AGENT_CFG_DIR/credentials.json" ]]; then
+  info "步骤 5/6：把控制面上的最新配置同步到 $HY_CFG"
+  if "$AGENT_BIN" -config "$AGENT_CFG" config sync; then
+    log "配置已同步（历史与回滚：$AGENT_BIN config history -config $AGENT_CFG）"
+  else
+    warn "配置同步未完成（控制面不可达 / 还没有已发布的配置 / 新配置没通过校验）—— 保留现有 $HY_CFG 不动"
+  fi
+elif [[ "$SYNC_CONFIG" == "0" ]]; then
+  info "步骤 5/6：按 --no-sync-config 跳过配置同步"
+else
+  info "步骤 5/6：本机还没有凭据（尚未注册），跳过配置同步"
+fi
+
 if [[ $HAS_SYSTEMD -eq 1 ]]; then
   systemctl enable "$AGENT_SERVICE" >/dev/null 2>&1 || true
   systemctl restart "$AGENT_SERVICE" || warn "启动 $AGENT_SERVICE 失败"
@@ -711,7 +730,7 @@ if [[ $HAS_SYSTEMD -eq 1 ]]; then
 fi
 
 # ---------------------------------------------------------------- 5. 验证
-info "步骤 5/5：验证"
+info "步骤 6/6：验证"
 sleep 2
 verify || warn "验证未完全通过，请按上面的提示排查"
 echo >&2
