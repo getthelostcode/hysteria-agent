@@ -26,6 +26,7 @@ type EnrollRequest struct {
 	OS              string `json:"os"`
 	Arch            string `json:"arch"`
 	Kernel          string `json:"kernel,omitempty"`
+	MachineID       string `json:"machine_id,omitempty"`
 	BootID          string `json:"boot_id,omitempty"`
 	AgentVersion    string `json:"agent_version"`
 	HysteriaVersion string `json:"hysteria_version,omitempty"`
@@ -46,6 +47,7 @@ type EnrollResponse struct {
 	JWTAudience              string   `json:"jwt_audience,omitempty"`
 	HeartbeatIntervalSeconds int      `json:"heartbeat_interval_seconds,omitempty"`
 	TelemetryIntervalSeconds int      `json:"telemetry_interval_seconds,omitempty"`
+	ConfigRevision           string   `json:"config_revision,omitempty"`
 	ServerVersion            string   `json:"server_version,omitempty"`
 	Message                  string   `json:"message,omitempty"`
 }
@@ -212,6 +214,11 @@ func (s *Server) handleEnroll(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusUnauthorized, "缺少 enroll_token（body.enroll_token 或 X-Enroll-Token）")
 		return
 	}
+	// 桥接模式：令牌由 Laravel 校验，身份也由 Laravel 签发（本地不做令牌记账）。
+	if s.cfg.UsesLaravelIdentity() {
+		s.handleLaravelEnroll(w, r, req)
+		return
+	}
 	tok, err := s.store.UseToken(req.EnrollToken, firstNonEmpty(req.NodeName, req.Hostname))
 	if err != nil {
 		s.metrics.bump("enroll_failed")
@@ -265,7 +272,8 @@ func (s *Server) handleControl(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusUnauthorized, "未知节点或节点已吊销")
 		return
 	}
-	claims, err := creds.VerifyJWT(tok, s.store.DeriveSecret(nodeID))
+	// 桥接节点的密钥由 Laravel 下发；老节点回退到主密钥派生（NodeSecret 内部处理）。
+	claims, err := creds.VerifyJWT(tok, s.store.NodeSecret(nodeID))
 	if err != nil {
 		s.metrics.bump("ws_rejected")
 		s.log.Warn("控制通道拒绝：JWT 校验失败", "node_id", nodeID, "err", err)

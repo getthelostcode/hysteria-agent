@@ -33,6 +33,34 @@ Hysteria2 节点的**管理守护进程**：一条 WebSocket + Protobuf 长连�
 * Hysteria 2 服务端（Agent 可以代为安装/守护，也可以只管已有的实例）
 * 控制面：**本仓库自带一份可直接上线的实现**（`bin/controlplane`，见下节）；也可以自己实现，只要满足 [DESIGN.md §5.1](DESIGN.md) 的三个接口（`cmd/mockcontrol` 是 200 行的最小参考实现）
 
+
+## 桥接模式（身份由 Laravel 控制面签发）
+
+让本仓库的 Go 控制面只终结 agent 的 Envelope 通道，**身份/数据全部落在 Laravel 控制面**
+（面板是唯一 UI/审计/权限源）。设计见 `docs/BRIDGE-TO-CONTROL-PLANE.md`。
+
+```yaml
+# /etc/hysteria-controlplane/config.yaml
+identity:
+  authority: "laravel"
+laravel:
+  base_url: "https://cp.example.com"     # Laravel 控制面（面板所在站点）
+  enroll_path: "/api/v1/agent/enroll"
+poll: { config_seconds: 2, commands_seconds: 10, fallback_only: true }
+reverb: { enabled: true, key: "<REVERB_APP_KEY>", host: "cp.example.com", port: 443, scheme: "https" }
+```
+
+```bash
+controlplane serve -config /etc/hysteria-controlplane/config.yaml   # 启动时会探活 Laravel
+hysteria-agent enroll --token=<面板生成的一次性令牌>                 # 走本控制面即可
+```
+
+* 注册被**原样代理**到 Laravel：返回的 `node_id` / `node_secret` 就是 Laravel 下发的，
+  面板立刻能看到该节点（同一个 `node_id`）；`401/409` 等状态码与响应体原样透传。
+* 本控制面把 per-node secret 存进 `state.json`（0600），用于替节点签 REST（S4 起）。
+* 老的独立模式（`authority: local`，node_secret 由 master_key 派生）保持可用，升级后行为不变。
+* 自检：`go run ./cmd/cpapi-smoke -cp https://cp.example.com -email <admin> -password <pw>`
+
 ## 控制面（内置，开箱可用）
 
 控制面不需要你自己写：`cmd/controlplane` 是完整实现——节点注册、控制通道、配置下发、指令下发、事件归档、指标、只读仪表盘。

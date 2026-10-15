@@ -39,6 +39,14 @@ type Config struct {
 	LogLevel   string    `yaml:"log_level" json:"log_level"`
 	Retention  Retention `yaml:"retention" json:"retention"`
 	ServeDash  *bool     `yaml:"dashboard" json:"dashboard"`
+
+	// 桥接配置（见 identity.go 与 docs/BRIDGE-TO-CONTROL-PLANE.md）：
+	// Identity 决定身份权威，Laravel 指向面板侧控制面，Poll/Reverb/Bridge 控制桥接行为。
+	Identity IdentityConfig `yaml:"identity" json:"identity"`
+	Laravel  LaravelConfig  `yaml:"laravel" json:"laravel"`
+	Poll     PollConfig     `yaml:"poll" json:"poll"`
+	Reverb   ReverbConfig   `yaml:"reverb" json:"reverb"`
+	Bridge   BridgeConfig   `yaml:"bridge" json:"bridge"`
 }
 
 // TLSConfig 控制面自身的监听 TLS（放在 Cloudflare Tunnel / nginx 后面时可留空）。
@@ -68,6 +76,12 @@ func DefaultConfig() *Config {
 		WSPath:     "/api/v1/agent/control",
 		Heartbeat:  HBConfig{IntervalSeconds: 30, TimeoutSeconds: 90, TelemetrySeconds: 15},
 		Retention:  Retention{MaxEventsPerNode: 20000},
+		// 默认保持独立模式：老部署升级后行为不变；要接 Laravel 面板再改 identity.authority。
+		Identity: DefaultIdentityConfig(),
+		Laravel:  DefaultLaravelConfig(),
+		Poll:     DefaultPollConfig(),
+		Reverb:   DefaultReverbConfig(),
+		Bridge:   DefaultBridgeConfig(),
 	}
 }
 
@@ -95,6 +109,12 @@ type Node struct {
 	Connects         int    `json:"connects"`
 	Revoked          bool   `json:"revoked,omitempty"`
 	Note             string `json:"note,omitempty"`
+
+	// Secret 只在 identity.authority=laravel 时存在：Laravel 下发的长期密钥，
+	// 本控制面用它替该节点签 REST（state.json 0600，与 Laravel 侧 secret 同值）。
+	Secret string `json:"secret,omitempty"`
+	// Authority 记录身份来源：local（master_key 派生）或 laravel（控制面签发）。
+	Authority string `json:"identity_authority,omitempty"`
 
 	AckedSeq       uint64 `json:"acked_seq"`
 	DuplicateMsgs  uint64 `json:"duplicate_msgs"`
@@ -247,6 +267,57 @@ func (s *Store) DeriveSecret(nodeID string) string {
 
 // MasterKey 返回主密钥（hex）。
 func (s *Store) MasterKey() string { return hex.EncodeToString(s.masterKey) }
+
+// NodeSecret 返回该节点的长期密钥：
+// 桥接模式下用 Laravel 下发的值，其余（含升级前的老节点）回退到主密钥派生。
+func (s *Store) NodeSecret(nodeID string) string {
+	if n, ok := s.Node(nodeID); ok && n.Secret != "" {
+		return n.Secret
+	}
+
+	return s.DeriveSecret(nodeID)
+}
+
+// MirrorExternalNode 记录/更新一个由外部身份权威（Laravel）签发的节点。
+// nodeID 与 secret 都由 Laravel 决定，本控制面不再派生。
+func (s *Store) MirrorExternalNode(req EnrollRequest, nodeID, secret, authority, tokenName string) (*Node, error) {
+	nodeID = strings.TrimSpace(nodeID)
+	if nodeID == "" || strings.TrimSpace(secret) == "" {
+		return nil, fmt.Errorf("镜像外部节点需要 node_id 与 secret")
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	n, exists := s.state.Nodes[nodeID]
+	if !exists {
+		n = &Node{ID: nodeID, EnrolledAt: time.Now().UnixMilli(), ConfigState: "unknown"}
+		s.state.Nodes[nodeID] = n
+	}
+
+	n.Name = firstNonEmpty(req.NodeName, req.Hostname, n.Name, nodeID)
+	n.Hostname = firstNonEmpty(req.Hostname, n.Hostname)
+	n.OS = firstNonEmpty(req.OS, n.OS)
+	n.Arch = firstNonEmpty(req.Arch, n.Arch)
+	n.Kernel = firstNonEmpty(req.Kernel, n.Kernel)
+	n.BootID = firstNonEmpty(req.BootID, n.BootID)
+	n.AgentVersion = firstNonEmpty(req.AgentVersion, n.AgentVersion)
+	n.HysteriaVersion = firstNonEmpty(req.HysteriaVersion, n.HysteriaVersion)
+	n.EnrollTokenName = firstNonEmpty(tokenName, n.EnrollTokenName, "laravel")
+	n.Secret = strings.TrimSpace(secret)
+	n.Authority = authority
+	if !exists {
+		n.Revoked = false
+	}
+
+	if err := s.saveLocked(); err != nil {
+		return nil, err
+	}
+
+	copy := *n
+
+	return &copy, nil
+}
 
 // Save 原子落盘。
 func (s *Store) Save() error {

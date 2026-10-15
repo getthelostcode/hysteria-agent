@@ -216,15 +216,24 @@ bridge:
 
 ## 10. 实施步骤与验收
 
-| 步骤 | 内容 | 验收 |
+| 步骤 | 内容 | 验收 | 状态 |
 |---|---|---|
-| S1 | Laravel：6 个新指令类型 + 危险类型限权 + 测试 | `php artisan test` 全绿（新增 ≥3 用例） |
-| S2 | Go：`internal/cpapi`（签名 + 客户端）+ 单测 | 单测用 httptest 校验签名原文/重放/超时；与 Laravel e2e 脚本对拍 |
-| S3 | Go：enroll 代理 + state.json 凭据存储 | e2e：agent 注册 → Laravel `nodes` 出现该节点（同一 node_id/secret） |
+| S1 | Laravel：6 个新指令类型 + 危险类型限权 + 测试 | `php artisan test` 全绿（新增 ≥3 用例） |✅ 完成（107 用例/491 断言，8 个新用例）
+| S2 | Go：`internal/cpapi`（签名 + 客户端）+ 单测 | 单测用 httptest 校验签名原文/重放/超时；与 Laravel e2e 脚本对拍 |✅ 完成（11 单测含跨语言黄金向量；`cmd/cpapi-smoke` 对真实控制面 10/10）
+| S3 | Go：enroll 代理 + state.json 凭据存储 | e2e：agent 注册 → Laravel `nodes` 出现该节点（同一 node_id/secret） |✅ 完成（真机验证：同一 node_id；secret 两边互认；409 透传；state.json 0600）
 | S4 | Go：心跳/遥测/日志转发 | 面板 5s 内看到指标曲线与日志 |
 | S5 | Go：配置下发 + 回执（含失败回滚） | 面板发布 → agent 热重载 → 面板 `applied`；注入坏配置 → 面板自动 rollback |
 | S6 | Go：指令双向 + Reverb 订阅 + 轮询兜底 | 面板点「重启」→ 2s 内 ack；断掉 Reverb 仍在 ≤10s 内送达 |
 | S7 | Go：降级 outbox 补发 | 停 Laravel → 产生遥测/回执 → 恢复后全部落到面板，无丢无重 |
 | S8 | 文档 + 部署（systemd 两份 unit、cloudflared 路径路由） | `install-controlplane.sh` 一键后 agent 可直接 enroll |
+
+## 11. 进度
+
+- [x] **S1** Laravel：6 个 agent 原生指令类型 + 危险类型限权 + 通道列（`hysteria-control-plane@97b6df1`）
+- [x] **S2** Go：`internal/cpapi` 签名客户端 + 11 单测（跨语言黄金向量）+ `cmd/cpapi-smoke`
+- [x] **S3** Go：`identity.authority: laravel` —— enroll 代理、per-node secret 入库（state.json 0600）、
+      通道鉴权改用下发密钥、启动探活、409/401 原样透传
+- [ ] S4 心跳/遥测/日志转发  · [ ] S5 配置下发+回执（含失败自动回滚） · [ ] S6 指令双向 + Reverb 事件驱动
+- [ ] S7 Laravel 不可达时的 outbox 补发 · [ ] S8 部署（cloudflared 路径路由 + 两份 unit）
 
 约定：**路径与字段以 Laravel 侧为准**（它是契约发布方）；Go 侧只做映射，任何字段变动先改 Laravel 的 `docs/API.md` 与 OpenAPI（`/docs/api.json`），再同步 Go。

@@ -55,3 +55,33 @@ retention:
 
 # 是否提供只读仪表盘（GET /）。false 可关闭（省掉一个页面，不影响 API）。
 dashboard: true
+
+# ---------------------------------------------------------------------------
+# 桥接（对接 Laravel 控制面/面板）
+# ---------------------------------------------------------------------------
+# authority: local   —— 默认：本控制面用 master_key 自行派生 node_secret（独立模式）
+# authority: laravel —— 桥接：注册代理给 Laravel（身份唯一权威），本控制面保存
+#                       per-node secret 并替节点签 REST；面板即成为唯一 UI/审计源。
+# 设计见 docs/BRIDGE-TO-CONTROL-PLANE.md。
+identity:
+  authority: "local"
+laravel:
+  base_url: ""                       # 例：https://cp.example.com；改 authority 前必须填
+  admin_token: ""                    # 可选：面板运维 token（订阅 fleet、触发配置回滚）
+  enroll_path: "/api/v1/agent/enroll"
+  request_timeout_seconds: 15
+  retry: { initial_seconds: 1, max_seconds: 300, multiplier: 2, jitter: 0.2 }
+poll:
+  config_seconds: 2                  # 未订阅 Reverb 时的配置轮询间隔
+  commands_seconds: 10               # 指令兜底轮询间隔
+  fallback_only: true                # true = 有 Reverb 事件时暂停轮询
+reverb:
+  enabled: false                     # 订阅 Laravel 的 private-fleet：配置/指令事件驱动
+  key: ""                            # REVERB_APP_KEY
+  host: ""                           # 例：cp.example.com
+  port: 443
+  scheme: "https"
+bridge:
+  gzip_metrics: true                 # 指标批量 gzip（签名针对压缩后字节）
+  max_metric_batch: 500              # 与 Laravel AGENT_MAX_METRIC_SAMPLES 对齐
+  outbox_dir: ""                     # 留空 = <state_dir>/outbox（Laravel 不可达时缓存）

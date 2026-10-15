@@ -5,6 +5,9 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
+	"fmt"
+	"github.com/getthelostcode/hysteria-agent/internal/version"
+	"net/url"
 	"strings"
 	"time"
 )
@@ -109,4 +112,29 @@ func itoa(n int) string {
 		buf[i] = '-'
 	}
 	return string(buf[i:])
+}
+
+// versionString 控制面版本（供 User-Agent / 注册响应用）。
+func versionString() string {
+	if strings.TrimSpace(version.Version) == "" {
+		return "dev"
+	}
+
+	return version.Version
+}
+
+// parseURL 校验绝对 URL（只允许 http/https）。
+func parseURL(raw string) (*url.URL, error) {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil {
+		return nil, err
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return nil, fmt.Errorf("只支持 http/https，收到 %q", u.Scheme)
+	}
+	if u.Host == "" {
+		return nil, fmt.Errorf("缺少主机名")
+	}
+
+	return u, nil
 }

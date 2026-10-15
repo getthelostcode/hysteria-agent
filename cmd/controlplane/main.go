@@ -222,6 +222,15 @@ func cmdServe(argv []string, cfgPath string) int {
 	}
 	srv := cp.New(cfg, store, logger)
 
+	// 桥接模式启动自检：Laravel 不可达时仍然启动（注册会等到它恢复），但要显式告警。
+	if cfg.UsesLaravelIdentity() {
+		if err := cfg.ProbeLaravel(context.Background()); err != nil {
+			logger.Warn("Laravel 控制面探活失败：服务继续启动，注册/上报会在恢复后自动可用", "err", err, "base_url", cfg.Laravel.BaseURL)
+		} else {
+			logger.Info("身份权威：laravel（Laravel 控制面可达）", "base_url", cfg.Laravel.BaseURL)
+		}
+	}
+
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 	if err := srv.Serve(ctx); err != nil {
@@ -241,6 +250,10 @@ func LoadConfig(path string) (*cp.Config, error) {
 	}
 	if err := yaml.Unmarshal(b, cfg); err != nil {
 		return nil, fmt.Errorf("解析 %s 失败: %w", path, err)
+	}
+	// 补齐新增配置块（老配置文件没有这些键也不会崩），并校验自洽性。
+	if err := cfg.Validate(); err != nil {
+		return nil, err
 	}
 	return cfg, nil
 }
