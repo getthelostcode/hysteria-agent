@@ -17,6 +17,7 @@ import (
 	"log/slog"
 	"math/rand"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -94,9 +95,14 @@ type Client struct {
 	configSHA256    string
 	hysteriaRunning bool
 	ready           bool
+	publicIPAddr    string
 	lastAckAt       time.Time
 	firstResendMark uint64
 	lastDropped     uint64
+
+	// REST 兜底：控制通道端点不可用（404/405/501，例如 Laravel 面板）时的降级状态
+	restFallback bool
+	lastSeen     time.Time
 }
 
 // New 构建客户端。
@@ -238,6 +244,15 @@ func (c *Client) Run(ctx context.Context) {
 			c.mu.Lock()
 			c.lastErr = err.Error()
 			c.mu.Unlock()
+
+			// 对端根本没实现控制通道（404/405/501）：退化为 REST 心跳，
+			// 否则节点除注册外与控制面再无往来，面板「最后心跳」永远不动。
+			if shouldFallBack(err, c.cfg) {
+				c.runRESTFallback(ctx, err)
+				if ctx.Err() != nil {
+					return
+				}
+			}
 		}
 		c.mu.Lock()
 		c.sess = nil
@@ -347,7 +362,9 @@ func (c *Client) session(ctx context.Context) error {
 	conn, resp, err := dialer.DialContext(dctx, endpoint, header)
 	if err != nil {
 		if resp != nil {
-			return fmt.Errorf("握手失败 HTTP %d: %w", resp.StatusCode, err)
+			// 带上状态码：404/405/501 表示对端**没有实现**这个端点（例如 Laravel 面板
+			// 终结不了二进制 WS），此时应退化为 REST 心跳而不是无限重试握手。
+			return &HandshakeError{Status: resp.StatusCode, Err: err}
 		}
 		return fmt.Errorf("拨号失败: %w", err)
 	}
@@ -693,6 +710,30 @@ func (c *Client) applyHelloAck(ack *agentpb.HelloAck, s *session) {
 	}
 }
 
+// HandshakeError 控制通道握手被对端拒绝。
+type HandshakeError struct {
+	Status int
+	Err    error
+}
+
+func (e *HandshakeError) Error() string {
+	return fmt.Sprintf("握手失败 HTTP %d: %v", e.Status, e.Err)
+}
+
+func (e *HandshakeError) Unwrap() error {
+	return e.Err
+}
+
+// Unimplemented 表示对端没有实现控制通道端点（404/405/501），可以走 REST 兜底。
+func (e *HandshakeError) Unimplemented() bool {
+	switch e.Status {
+	case http.StatusNotFound, http.StatusMethodNotAllowed, http.StatusNotImplemented:
+		return true
+	default:
+		return false
+	}
+}
+
 // ---------------------------- 由 agent 注入的握手/状态钩子 ----------------------------
 
 // SetHandshakeMeta 在 Run 之前调用，把 Hello 需要的运行态元数据交给客户端。
@@ -735,6 +776,49 @@ func (c *Client) RequireAuthRoundTrip(ctx context.Context) error {
 		return fmt.Errorf("JWT 自检失败: HTTP %d", resp.StatusCode)
 	}
 	return nil
+}
+
+// SetPublicIP 记录自报的出口公网地址（REST 心跳会带上；控制面在隧道后只能看到代理地址）。
+func (c *Client) SetPublicIP(ip string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.publicIPAddr = strings.TrimSpace(ip)
+}
+
+func (c *Client) publicIP() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	return c.publicIPAddr
+}
+
+func (c *Client) hysteriaVersionSnapshot() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	return c.hysteriaVersion
+}
+
+func (c *Client) configRevisionSnapshot() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	return c.configRevision
+}
+
+func (c *Client) readySnapshot() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	return c.ready
+}
+
+func (c *Client) hysteriaRunningSnapshot() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	return c.hysteriaRunning
 }
 
 // MarshalStatus 便于 CLI 输出。

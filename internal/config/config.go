@@ -28,10 +28,14 @@ type Reconnect struct {
 
 // Control 控制面连接参数。
 type Control struct {
-	ServerURL          string   `yaml:"server_url"`
-	WSPath             string   `yaml:"ws_path"`
-	EnrollPath         string   `yaml:"enroll_path"`
-	TokenPath          string   `yaml:"token_path"` // 可选：用 node_secret 换新 JWT 的端点（本地自签 JWT 时不用）
+	ServerURL  string `yaml:"server_url"`
+	WSPath     string `yaml:"ws_path"`
+	EnrollPath string `yaml:"enroll_path"`
+	TokenPath  string `yaml:"token_path"` // 可选：用 node_secret 换新 JWT 的端点（本地自签 JWT 时不用）
+	// RESTHeartbeatPath：控制通道不可用时的心跳兜底端点。控制面必须能终结
+	// /api/v1/agent/control 这个二进制 WS —— Laravel/PHP 终结不了（返回 501），
+	// 没有兜底的话节点除注册外与控制面再无任何往来，面板「最后心跳」永远是注册时刻。
+	RESTHeartbeatPath  string   `yaml:"rest_heartbeat_path"`
 	UserAgent          string   `yaml:"user_agent"`
 	CAFile             string   `yaml:"ca_file"`
 	PinSHA256          []string `yaml:"pin_sha256"` // 证书 SPKI pin（base64）；空则不做 pinning
@@ -51,6 +55,11 @@ type Control struct {
 	Reconnect                Reconnect `yaml:"reconnect"`
 	// TokenRefreshLeewaySeconds：JWT 剩余寿命小于该值时重连前重新签发。
 	TokenRefreshLeewaySeconds float64 `yaml:"token_refresh_leeway_seconds"`
+
+	// RESTFallbackSeconds：控制通道握手被拒（404/405/501 = 对端没有实现该端点）时，
+	// 退化为 REST 心跳的持续时长；0 关闭。到期后重新尝试控制通道（例如控制面换成了
+	// 能终结 WS 的 Go 控制面），所以两端都不会僵死。
+	RESTFallbackSeconds float64 `yaml:"rest_fallback_seconds"`
 }
 
 // Hysteria 被管理的 Hysteria2 服务端。
@@ -201,6 +210,7 @@ func Default() *Config {
 			WSPath:                    "/api/v1/agent/control",
 			EnrollPath:                "/api/v1/agent/enroll",
 			TokenPath:                 "/api/v1/agent/token",
+			RESTHeartbeatPath:         "/api/v1/agent/heartbeat",
 			UserAgent:                 "hysteria-agent",
 			ConnectTimeoutSeconds:     15,
 			HandshakeTimeoutSeconds:   20,
@@ -212,6 +222,7 @@ func Default() *Config {
 			JWTExpirySeconds:          3600,
 			MaxMessageBytes:           4 << 20,
 			TokenRefreshLeewaySeconds: 300,
+			RESTFallbackSeconds:       300,
 			Reconnect:                 Reconnect{InitialSeconds: 1, MaxSeconds: 300, Multiplier: 2, Jitter: 0.2},
 		},
 		CredentialsFile: DefaultCredsPath,

@@ -30,12 +30,15 @@ type Metrics struct {
 	ControlUptime     prometheus.Gauge
 	HeartbeatSent     prometheus.Counter
 	HeartbeatAcked    prometheus.Counter
-	EventsSent        prometheus.Counter
-	EventsResent      prometheus.Counter
-	EventsBuffered    prometheus.Gauge
-	EventsDropped     prometheus.Counter
-	OutboxBytes       prometheus.Gauge
-	OutboxCompactions prometheus.Counter
+	// REST 心跳兜底（控制通道端点不可用时，面板仍能看到节点在线）
+	RESTHeartbeats        prometheus.Counter
+	RESTHeartbeatFailures prometheus.Counter
+	EventsSent            prometheus.Counter
+	EventsResent          prometheus.Counter
+	EventsBuffered        prometheus.Gauge
+	EventsDropped         prometheus.Counter
+	OutboxBytes           prometheus.Gauge
+	OutboxCompactions     prometheus.Counter
 
 	ConfigApplyTotal   *prometheus.CounterVec // result=ok|rejected|failed|rolled_back|dry_run
 	ConfigApplySeconds *prometheus.HistogramVec
@@ -97,6 +100,10 @@ func New(nodeID string) *Metrics {
 			Name: "hysteria_agent_heartbeat_sent_total", Help: "已发送心跳数", ConstLabels: constLabels}),
 		HeartbeatAcked: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "hysteria_agent_heartbeat_acked_total", Help: "已确认心跳数", ConstLabels: constLabels}),
+		RESTHeartbeats: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "hysteria_agent_rest_heartbeats_total", Help: "REST 兜底心跳成功次数（控制通道端点不可用时）", ConstLabels: constLabels}),
+		RESTHeartbeatFailures: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "hysteria_agent_rest_heartbeat_failures_total", Help: "REST 兜底心跳失败次数", ConstLabels: constLabels}),
 		EventsSent: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "hysteria_agent_events_sent_total", Help: "已投递事件数", ConstLabels: constLabels}),
 		EventsResent: prometheus.NewCounter(prometheus.CounterOpts{

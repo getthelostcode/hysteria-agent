@@ -34,6 +34,21 @@ Hysteria2 节点的**管理守护进程**：一条 WebSocket + Protobuf 长连�
 * 控制面：**本仓库自带一份可直接上线的实现**（`bin/controlplane`，见下节）；也可以自己实现，只要满足 [DESIGN.md §5.1](DESIGN.md) 的三个接口（`cmd/mockcontrol` 是 200 行的最小参考实现）
 
 
+### 控制通道不可用时的 REST 兜底心跳
+
+控制通道是二进制 protobuf WebSocket；**Laravel/PHP 一类的控制面终结不了它**（返回 501）。
+这时 agent 不再盲目重试，而是降级为定时 POST `control.rest_heartbeat_path`
+（默认 `/api/v1/agent/heartbeat`），让面板的「最后心跳」与在线状态保持真实：
+
+* 只处理 404/405/501 —— 认证失败（401/403）不会降级，避免掩盖凭据问题；
+* 持续 `control.rest_fallback_seconds`（默认 300s）后重新尝试控制通道，
+  控制面换成能终结 WS 的实现后最迟一个窗口自动恢复；
+* 指标/日志目前仍走控制通道（REST 兜底只补心跳，见 docs/BRIDGE-TO-CONTROL-PLANE.md）；
+* 观测：`hysteria_agent_rest_heartbeats_total` / `hysteria_agent_rest_heartbeat_failures_total`。
+
+真机验证：`PANEL_URL=http://127.0.0.1:8001 bash tests/rest_fallback_e2e.sh`（9 项断言，
+含「最后心跳持续前移」）。
+
 ## 桥接模式（身份由 Laravel 控制面签发）
 
 让本仓库的 Go 控制面只终结 agent 的 Envelope 通道，**身份/数据全部落在 Laravel 控制面**

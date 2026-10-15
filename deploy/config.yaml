@@ -10,6 +10,11 @@ control:
   ws_path: "/api/v1/agent/control"        # 控制通道（WebSocket）路径
   enroll_path: "/api/v1/agent/enroll"     # 注册接口路径
   token_path: "/api/v1/agent/token"       # 可选：用 node_secret 换 JWT 的接口
+  # 控制通道端点被对端拒绝为 404/405/501（对端没实现二进制 WS，例如 Laravel/PHP 面板）时，
+  # 降级为定时打这个 REST 心跳端点；0 关闭。窗口到期后会重新尝试控制通道，
+  # 所以控制面换成能终结 WS 的 Go 控制面后最迟一个窗口自动恢复。
+  rest_heartbeat_path: "/api/v1/agent/heartbeat"
+  rest_fallback_seconds: 300              # [默认 300] 0 = 关闭兜底
   user_agent: "hysteria-agent"
   ca_file: ""                             # 私有 CA（PEM）；留空用系统根证书
   pin_sha256: []                          # 证书 SPKI pin（base64），非空则强制 pinning
