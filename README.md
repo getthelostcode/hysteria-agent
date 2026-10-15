@@ -34,6 +34,18 @@ Hysteria2 节点的**管理守护进程**：一条 WebSocket + Protobuf 长连�
 * 控制面：**本仓库自带一份可直接上线的实现**（`bin/controlplane`，见下节）；也可以自己实现，只要满足 [DESIGN.md §5.1](DESIGN.md) 的三个接口（`cmd/mockcontrol` 是 200 行的最小参考实现）
 
 
+### 更新节点：装到的必须是新构建
+
+`install.sh` 优先用仓库里入库的发布产物 `dist/hysteria-agent-linux-<arch>`。**只 `git pull` 不会更新它**，
+所以会出现「代码是新的、行为是旧的」（真实现场：装到 12:52 那份还没有配置轮询的构建，于是面板发布的配置
+永远停在 `published`）。现在 install.sh 会：
+
+* 比较 `dist/` 二进制与仓库里最新 `.go` 的修改时间；**源码更新 → 直接用当前源码重新构建**（`go build`，ldflags 带真实 commit）；
+* 没有 Go 工具链时**明确 WARN**（告诉你在有 Go 的机器上 `make build` 后重跑），而不是静默装旧的；
+* 安装后打印构建信息（`hysteria-agent 0.1.0 (<commit>, <time>)`）—— 到节点上对一下就知道装的哪一版。
+
+回归：`bash tests/install_binary_freshness_test.sh`（10 项断言，含「用 go shim 验证确实走了源码重建」）。
+
 ### 配置下发也是 REST 兜底（面板「发布配置」靠它生效）
 
 控制通道 501（Laravel 终结不了二进制 WS）时，agent 不只在 REST 里发心跳，还会**轮询配置**：

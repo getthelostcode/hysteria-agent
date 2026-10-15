@@ -240,6 +240,35 @@ set_hysteria_auth_http() {
 }
 
 
+# ---------------------------------------------------------------- 二进制新鲜度
+# 仓库里带的是**编译好的**发布产物（dist/hysteria-agent-linux-<arch>）。只改源码 + git pull 的机器
+# 会拿这份旧二进制装上，然后表现成“新功能没生效” —— 真实现场：装到的还是 12:52 那份
+# （那时还没有配置轮询），于是面板发布的配置在库里一直 applied_at 为空。
+agent_binary_stale() { # <binary>：仓库里有比它更新的 .go 源码就算过期
+  local bin="$1"
+  [[ -f "$bin" ]] || return 1
+  [[ -n "$(find "$SCRIPT_DIR" -name '*.go' -newer "$bin" -print -quit 2>/dev/null)" ]]
+}
+
+agent_go() { # 找一个可用的 Go 工具链
+  if [[ -n "${GO:-}" && -x "${GO}" ]]; then echo "${GO}"; return 0; fi
+  if command -v go >/dev/null 2>&1; then command -v go; return 0; fi
+  if [[ -x /usr/local/go/bin/go ]]; then echo /usr/local/go/bin/go; return 0; fi
+  return 1
+}
+
+build_agent_from_source() { # <out>：用仓库源码构建（带上真实 commit，便于事后对账）
+  local out="$1" go commit
+  go="$(agent_go)" || return 1
+  commit="$(cd "$SCRIPT_DIR" && git rev-parse --short HEAD 2>/dev/null || echo dev)"
+  ( cd "$SCRIPT_DIR" && "$go" build -trimpath \
+      -ldflags "-s -w \
+        -X github.com/getthelostcode/hysteria-agent/internal/version.Version=${AGENT_VERSION:-0.1.0} \
+        -X github.com/getthelostcode/hysteria-agent/internal/version.Commit=${commit} \
+        -X github.com/getthelostcode/hysteria-agent/internal/version.BuildTime=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+      -o "$out" ./cmd/hysteria-agent ) >/dev/null 2>&1
+}
+
 # ---------------------------------------------------------------- 0. verify-only
 verify() {
   local rc=0
@@ -389,8 +418,20 @@ if [[ -n "${AGENT_BINARY_URL:-}" ]]; then
   curl -fsSL "$AGENT_BINARY_URL" -o "$AGENT_BIN.new" || die "下载 $AGENT_BINARY_URL 失败"
   chmod 0755 "$AGENT_BIN.new"
 elif SRC_BIN="$(resolve_local_agent)"; then
-  info "使用本地二进制：$SRC_BIN"
-  install -m 0755 "$SRC_BIN" "$AGENT_BIN.new"
+  # 本地二进制可能是仓库里入库的旧构建：装上去会跑旧行为，且从版本号上看不出来。
+  if agent_binary_stale "$SRC_BIN"; then
+    warn "本地二进制 $SRC_BIN 比仓库源码旧（刚 git pull 过？）—— 直接用它会装成旧行为"
+    if build_agent_from_source "$AGENT_BIN.new"; then
+      info "已改用当前源码重新构建（$( "$AGENT_BIN.new" version 2>/dev/null | head -1)）"
+      SRC_BIN="源码构建"
+    else
+      warn "本机没有可用的 Go 工具链，只能沿用这份可能过期的二进制；缺新功能时请在有 Go 的机器上 make build 后重跑"
+      install -m 0755 "$SRC_BIN" "$AGENT_BIN.new"
+    fi
+  else
+    info "使用本地二进制：$SRC_BIN"
+    install -m 0755 "$SRC_BIN" "$AGENT_BIN.new"
+  fi
 elif download_agent; then
   info "已从 GitHub 下载 agent 二进制"
 elif [[ -x "$AGENT_BIN" ]]; then
