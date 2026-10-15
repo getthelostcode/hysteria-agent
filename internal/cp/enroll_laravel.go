@@ -106,6 +106,9 @@ func (s *Server) enrollViaLaravel(ctx context.Context, req EnrollRequest) (*cpap
 		// 「Go 控制面桥接」与「直连节点」；agent 自己的 protocol 版本号记在 CP 日志里。
 		Protocol: "bridge/v1",
 		Replace:  req.Replace,
+		// 节点自报的公网出口：Laravel 只会看到本控制面的地址（127.0.0.1），
+		// 所以面板要显示真实公网 IP 就必须靠这里透传。
+		PublicIP: req.PublicIP,
 	})
 	if err != nil {
 		var apiErr *cpapi.APIError

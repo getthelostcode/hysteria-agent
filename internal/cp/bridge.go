@@ -221,6 +221,8 @@ func heartbeatToLaravel(node *Node, hb *agentpb.Heartbeat) cpapi.HeartbeatReques
 	if node != nil {
 		req.AgentVersion = node.AgentVersion
 		req.Version = node.HysteriaVersion
+		// 面板侧只看到本控制面的地址，公网出口靠这里转发。
+		req.PublicIP = node.PublicIP
 		if node.Kernel != "" {
 			req.Meta["kernel"] = node.Kernel
 		}

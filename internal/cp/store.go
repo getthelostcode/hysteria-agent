@@ -95,9 +95,12 @@ type Node struct {
 	Kernel   string `json:"kernel,omitempty"`
 	BootID   string `json:"boot_id,omitempty"`
 
-	AgentVersion    string   `json:"agent_version,omitempty"`
-	HysteriaVersion string   `json:"hysteria_version,omitempty"`
-	Caps            []string `json:"capabilities,omitempty"`
+	AgentVersion    string `json:"agent_version,omitempty"`
+	HysteriaVersion string `json:"hysteria_version,omitempty"`
+	// PublicIP 是节点自报的出口公网地址：Laravel 面板只看到本控制面的 127.0.0.1
+	// （桥接模式下 Laravel 永远是本机调用的对端），必须由 agent 上报后转发。
+	PublicIP string   `json:"public_ip,omitempty"`
+	Caps     []string `json:"capabilities,omitempty"`
 
 	EnrolledAt       int64  `json:"enrolled_at_ms"`
 	EnrollTokenName  string `json:"enroll_token_name,omitempty"`
@@ -304,6 +307,7 @@ func (s *Store) MirrorExternalNode(req EnrollRequest, nodeID, secret, authority,
 	n.AgentVersion = firstNonEmpty(req.AgentVersion, n.AgentVersion)
 	n.HysteriaVersion = firstNonEmpty(req.HysteriaVersion, n.HysteriaVersion)
 	n.EnrollTokenName = firstNonEmpty(tokenName, n.EnrollTokenName, "laravel")
+	n.PublicIP = firstNonEmpty(strings.TrimSpace(req.PublicIP), n.PublicIP)
 	n.Secret = strings.TrimSpace(secret)
 	n.Authority = authority
 	if !exists {

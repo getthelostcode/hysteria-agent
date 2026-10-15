@@ -36,6 +36,9 @@ type Request struct {
 	AgentVersion    string `json:"agent_version"`
 	HysteriaVersion string `json:"hysteria_version,omitempty"`
 	Protocol        string `json:"protocol"`
+	// PublicIP：自报的出口公网地址。控制面在 NAT/隧道后只能看到代理地址（真实故障：
+	// 面板上所有节点的 IP 都是 127.0.0.1，因为 cloudflared 就在控制面本机）。
+	PublicIP string `json:"public_ip,omitempty"`
 	// Replace 为 true 时允许覆盖已存在的节点注册（需控制面支持）。
 	Replace bool `json:"replace,omitempty"`
 }
@@ -81,6 +84,12 @@ func Run(ctx context.Context, cfg *config.Config, opt Options, logf func(format 
 		return nil, fmt.Errorf("未配置 control.server_url，请先编辑 %s", cfg.Path)
 	}
 
+	// 自报公网 IP：尽力而为（探测失败不带该字段继续注册，绝不能让 IP 查询挡住注册）。
+	publicIP := detectPublicIP(ctx, cfg, logf)
+	if publicIP != "" {
+		logf("本机出口公网地址: %s（将随注册上报，便于控制面展示真实 IP）", publicIP)
+	}
+
 	// 注册阶段的 TLS：pin 只能来自配置文件（本地还没有凭据）。
 	// 用一份空凭据 + 配置里的 pin/ca 构建，逻辑与后续控制通道完全一致。
 	empty := &creds.Credentials{}
@@ -106,6 +115,7 @@ func Run(ctx context.Context, cfg *config.Config, opt Options, logf func(format 
 		AgentVersion: version.Version,
 		Protocol:     "v1",
 		Replace:      opt.Replace,
+		PublicIP:     publicIP,
 	}
 	if opt.HysteriaBin != "" {
 		reqBody.HysteriaVersion = sysinfo.BinaryVersion(ctx, opt.HysteriaBin, 5*time.Second)

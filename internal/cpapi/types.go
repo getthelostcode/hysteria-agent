@@ -18,6 +18,9 @@ type EnrollRequest struct {
 	HysteriaVersion string `json:"hysteria_version,omitempty"`
 	Protocol        string `json:"protocol,omitempty"`
 	Replace         bool   `json:"replace,omitempty"`
+	// PublicIP：节点自报的出口公网地址。控制面只能看到「对端代理」的地址
+	// （Cloudflare Tunnel/同机 cloudflared → 127.0.0.1），只有节点自己知道公网出口。
+	PublicIP string `json:"public_ip,omitempty"`
 }
 
 type EnrollResponse struct {
@@ -42,6 +45,7 @@ type HeartbeatRequest struct {
 	AgentVersion string            `json:"agent_version,omitempty"`
 	Uptime       int64             `json:"uptime,omitempty"`
 	IP           string            `json:"ip,omitempty"`
+	PublicIP     string            `json:"public_ip,omitempty"`
 	Region       string            `json:"region,omitempty"`
 	Tags         []string          `json:"tags,omitempty"`
 	Meta         map[string]string `json:"meta,omitempty"`

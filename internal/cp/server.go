@@ -32,6 +32,9 @@ type EnrollRequest struct {
 	HysteriaVersion string `json:"hysteria_version,omitempty"`
 	Protocol        string `json:"protocol"`
 	Replace         bool   `json:"replace,omitempty"`
+	// PublicIP：节点自报的出口公网地址（agent 侧枚举网卡/查询 IP 服务得到）。
+	// 桥接模式下 Laravel 只能看到本控制面的地址，没有这个字段面板就永远显示 127.0.0.1。
+	PublicIP string `json:"public_ip,omitempty"`
 }
 
 // EnrollResponse 与 Agent 的 enroll.Response 字段一致。
