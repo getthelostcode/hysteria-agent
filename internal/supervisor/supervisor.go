@@ -192,8 +192,29 @@ func (s *Supervisor) Stop(ctx context.Context) error {
 }
 
 // Restart 平滑重启：先优雅停止再启动。reason 会写进事件里，便于对账。
+//
+// systemd 模式下直接 `systemctl restart <service>`（systemd 自己会先停后起）：
+// 既少一次状态翻转（旧实现用 Stop+Start，会短暂把「期望运行」置 false），
+// 也是运维口令里最直白的「重新运行 hysteria-server」。
 func (s *Supervisor) Restart(ctx context.Context, reason string) error {
 	s.log.Info("重启 Hysteria", slog.String("reason", reason))
+
+	if s.cfg.Hysteria.Mode == ModeSystemd {
+		if err := s.systemctl(ctx, "restart"); err != nil {
+			return err
+		}
+		s.mu.Lock()
+		s.stopping = false
+		s.wanted = true
+		s.pid = s.systemdMainPID(ctx)
+		s.startedAt = time.Now()
+		s.mu.Unlock()
+		s.m.HysteriaRunning.Set(1)
+		s.emit(Event{Type: EventStarted, At: time.Now(), PID: s.Pid(), Reason: reason})
+
+		return s.WaitHealthy(ctx, s.cfg.Hysteria.StartupTimeout())
+	}
+
 	if err := s.Stop(ctx); err != nil {
 		s.log.Warn("停止 Hysteria 时出错，继续尝试启动", slog.String("error", err.Error()))
 	}

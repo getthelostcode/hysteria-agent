@@ -48,6 +48,12 @@ AGENT_CFG=$AGENT_CFG_DIR/config.yaml
 AGENT_STATE="${AGENT_STATE:-/var/lib/hysteria-agent}"
 AGENT_SERVICE="${AGENT_SERVICE:-hysteria-agent}"
 HY_SERVICE="${HYSTERIA_SERVICE:-hysteria-server}"
+# hysteria.mode：agent 怎么管 Hysteria ——
+#   systemd  交给 systemd（配置更新后 systemctl restart <HY_SERVICE>，即「重新运行 hysteria-server」）；
+#   process  agent 自己拉起子进程；external 只观测。
+# 默认自动：本机已有 <HY_SERVICE>.service 就选 systemd，否则 process。
+# 为什么默认要检测：agent 再拉起一份会和 systemd 那份撞端口（真实现场 jp8：udp :443 已被占用 → 反复失败回滚）。
+HY_MODE="${HY_MODE:-${HYSTERIA_MODE:-auto}}"
 HY_LISTEN="${HYSTERIA_LISTEN:-:443}"
 HY_VERSION="${HYSTERIA_VERSION:-v2.6.5}"
 HY_CFG="${HYSTERIA_CONFIG:-/etc/hysteria/config.yaml}"
@@ -89,6 +95,8 @@ while [[ $# -gt 0 ]]; do
     --hysteria-auth-url=*) HYSTERIA_AUTH_URL="${1#*=}"; HYSTERIA_AUTH_URL_PROVIDED=1 ;;
     --hysteria-auth-insecure) HYSTERIA_AUTH_INSECURE=1 ;;
     --no-hysteria)      NO_HYSTERIA=1 ;;
+    --hysteria-mode=*)  HY_MODE="${1#*=}" ;;      # process（agent 自己拉起）| systemd（交给 systemd）| external（只观测）
+    --hysteria-mode)    shift; HY_MODE="${1:-}" ;;
     --skip-enroll)      SKIP_ENROLL=1 ;;
     --no-sync-config)   SYNC_CONFIG=0 ;;
 #   --no-rebuild         只用仓库里那份发布二进制（版本可复现），不源码重建
@@ -106,6 +114,21 @@ done
 [[ $EUID -eq 0 ]] || die "请用 root 运行（需要写 /etc 和安装 systemd 单元）"
 HAS_SYSTEMD=1
 command -v systemctl >/dev/null 2>&1 || { HAS_SYSTEMD=0; warn "没有 systemctl（容器？），将只安装文件，不启动服务"; }
+
+# hysteria.mode=auto：按本机是否存在 <HY_SERVICE>.service 决定（必须在写 agent 配置之前算出来）
+if [[ "$HY_MODE" == "auto" ]]; then
+  if [[ "$NO_HYSTERIA" == "1" ]]; then
+    RESOLVED_HY_MODE="external"
+  elif [[ "$HAS_SYSTEMD" == "1" ]] && grep -q "^$HY_SERVICE\.service" <<<"$(systemctl list-unit-files 2>/dev/null || true)"; then
+    RESOLVED_HY_MODE="systemd"
+    info "检测到 $HY_SERVICE.service → hysteria.mode=systemd（由 systemd 管理；配置更新后 systemctl restart $HY_SERVICE）"
+  else
+    RESOLVED_HY_MODE="process"
+  fi
+else
+  RESOLVED_HY_MODE="$HY_MODE"
+fi
+
 
 # ---------------------------------------------------------------- 卸载
 if [[ $UNINSTALL -eq 1 ]]; then
@@ -668,7 +691,7 @@ credentials_file: "$AGENT_CFG_DIR/credentials.json"
 state_dir: "$AGENT_STATE"
 
 hysteria:
-  mode: process
+  mode: $RESOLVED_HY_MODE
   binary: /usr/local/bin/hysteria
   config_path: "$HY_CFG"
   service_name: "$HY_SERVICE"
@@ -695,6 +718,21 @@ outbox:
 
 $UPGRADE_BLOCK
 EOF
+# hysteria.mode=auto：按本机是否存在 <HY_SERVICE>.service 决定
+if [[ "$HY_MODE" == "auto" ]]; then
+  if [[ "$NO_HYSTERIA" == "1" ]]; then
+    RESOLVED_HY_MODE="external"
+  elif [[ "$HAS_SYSTEMD" == "1" ]] && grep -q "^$HY_SERVICE\.service" <<<"$(systemctl list-unit-files 2>/dev/null || true)"; then
+    RESOLVED_HY_MODE="systemd"
+    info "检测到 $HY_SERVICE.service → hysteria.mode=systemd（由 systemd 管理；配置更新后 systemctl restart $HY_SERVICE）"
+  else
+    RESOLVED_HY_MODE="process"
+  fi
+else
+  RESOLVED_HY_MODE="$HY_MODE"
+fi
+log "hysteria.mode=$RESOLVED_HY_MODE"
+
 log "已写入 $AGENT_CFG（api_base_url=$API_BASE, api_secret=$([[ -n $TS_SECRET ]] && echo '已对齐' || echo '缺失'))"
 
 # ---------------------------------------------------------------- 4. systemd + enroll

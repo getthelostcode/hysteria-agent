@@ -161,6 +161,47 @@ check "⑤ 装出来的二进制自报发布版本（${REAL_COMMIT_FILE}）" \
       "'${SANDBOX}/bin/hysteria-agent' version 2>/dev/null | grep -qF '(${REAL_COMMIT_FILE},'"
 check "⑤ 全程没有往宿主单元目录写东西" "[ ! -e /etc/systemd/system/ha-identity-test.service ]"
 
+
+echo "== 6) hysteria.mode 自动检测：本机已有 hysteria-server.service → systemd（配置更新后 systemctl restart）"
+printf '#!/bin/sh\necho "Version: v2.mock"\n' > "${WORK}/bin/hysteria"; chmod +x "${WORK}/bin/hysteria"
+
+run_install_full() { # 不带 --no-hysteria，让脚本走 Hysteria 分支（沙箱里一切都被 shim 拦下）
+  local tag="$1"; shift
+  AGENT_BIN="${SANDBOX}/bin/hysteria-agent" \
+  AGENT_CFG_DIR="${SANDBOX}/etc" \
+  AGENT_STATE="${SANDBOX}/var" \
+  SYSTEMD_UNIT_DIR="${SANDBOX}/units" \
+  AGENT_SERVICE="ha-identity-test" \
+  HYSTERIA_CONFIG="${SANDBOX}/etc/hysteria.yaml" \
+  HYSTERIA_SERVICE="hysteria-server" \
+    bash "${ROOT}/install.sh" "http://127.0.0.1:9" --skip-enroll --no-sync-config "$@" \
+    > "${SANDBOX}/logs/${tag}.log" 2>&1
+}
+
+# ① 假 systemctl 里存在 hysteria-server.service → 应选 systemd
+cat > "${WORK}/bin/systemctl" <<'SHIM'
+#!/bin/bash
+printf '[shim] systemctl %s\n' "$*" >> "${SHIM_LOG_SYSTEMCTL:-/dev/null}"
+case "$1" in
+  list-unit-files) echo "hysteria-server.service enabled enabled" ;;
+esac
+exit 0
+SHIM
+chmod +x "${WORK}/bin/systemctl"
+run_install_full mode-systemd
+check "⑥ 检测到单元 → mode: systemd" "grep -q '^  mode: systemd' '${SANDBOX}/etc/config.yaml'"
+check "⑥ 服务名写进配置（重启对象就是 hysteria-server）" "grep -q 'service_name: \"hysteria-server\"' '${SANDBOX}/etc/config.yaml'"
+check "⑥ 日志明确说了由 systemd 管理" "grep -q 'hysteria.mode=systemd' '${SANDBOX}/logs/mode-systemd.log'"
+
+# ② 没有该单元 → 回退 process（agent 自己拉起）
+cat > "${WORK}/bin/systemctl" <<'SHIM'
+#!/bin/bash
+exit 0
+SHIM
+chmod +x "${WORK}/bin/systemctl"
+run_install_full mode-process
+check "⑥ 没有单元 → mode: process" "grep -q '^  mode: process' '${SANDBOX}/etc/config.yaml'"
+
 echo
 printf '结果：%d 通过 / %d 失败\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]
