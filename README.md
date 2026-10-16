@@ -103,6 +103,11 @@ hysteria-agent config sync --reload      # 落盘后顺带重启被守护的 Hys
 
 守护进程默认就按「配置版本文件库的默认版本」收敛（`control.config_source` 留空 = `default`）：
 
+0. **校验不当门禁**（与 CLI 的 `config sync` 一致）：配置能解析出来就**照面板写的写**，
+   证书路径不存在、secret 与 agent 不一致、端口被占这类问题只作**警告**（写进回执与日志）；
+   只有「连 YAML 都解析不出来」才拒收。写坏了由就绪检查 + 自动回滚兜底。
+   这条曾经是硬门禁，后果是节点**永远不更新**（真实现场：japan2 每 4 秒回执一次
+   `证书/私钥无法加载: open /etc/hysteria/cert.pem: no such file or directory`，磁盘一直停在旧内容）。
 1. 每 `control.config_poll_seconds`（默认 5s）拉一次 `/api/v1/agent/config/default`，带上本机文件的
    `current_version` 与 `current_sha256`；
 2. 控制面按 **sha256** 判断「是不是同一份内容」—— 不一致就下发正文（库里没有默认版本时自动退回

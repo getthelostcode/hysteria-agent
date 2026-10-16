@@ -152,6 +152,17 @@ check "又重启了一次 Hysteria（启动记录增加）" "[ \"$STARTS2\" -gt 
 check "历史里留了可回滚的快照" "ls '$WORK/etc/hysteria/history' 2>/dev/null | grep -q ."
 check "MOCK_HYSTERIA_START_LOG 明细" "[ -s '$MOCK_HYSTERIA_START_LOG' ]"
 
+
+log "6) 面板给的配置与节点现状不符（trafficStats.secret 不一致）→ 按「面板为准」仍写入（不再拒收）"
+sed 's/secret: e2e-stats-secret/secret: plane-side-other-secret/; s/plane-default-v2/plane-mismatch/; s/18511/18521/' \
+  "$WORK/plane-default-v2.yaml" > "$WORK/plane-mismatch.yaml"
+curl -sS -m 5 -X POST --data-binary "@$WORK/plane-mismatch.yaml" "http://127.0.0.1:$CP_PORT/_test/set_default_config" >/dev/null
+PLANE_SHA3="$(sha "$WORK/plane-mismatch.yaml")"
+if wait_for "$PLANE_SHA3" 60; then ok "校验有问题的配置也写进去了（sha=$PLANE_SHA3）"; else
+  bad "没写入：本机 sha=$(sha "$WORK/etc/hysteria/config.yaml")  期望 $PLANE_SHA3（真实现场：japan2 因此永远不更新）"; fi
+check "内容确实是面板那份（含新 secret）" "grep -q 'plane-side-other-secret' '$WORK/etc/hysteria/config.yaml'"
+check "agent 日志里说清了「按面板为准仍写入」" "grep -q '按「面板为准」仍写入' '$WORK/logs/agent.log' || grep -q '校验有' '$WORK/logs/agent.log'"
+
 echo
 printf '结果：%d 通过 / %d 失败\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]

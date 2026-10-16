@@ -434,16 +434,32 @@ func (a *Agent) ApplyPayload(ctx context.Context, payload []byte, format, revisi
 	res := hyconfig.Validate(ctx, payload, format, opt)
 	ack.Warnings = res.Warnings
 	ack.Checks = res.Checks
-	if !res.Valid {
+
+	// 唯一的硬底线：**连配置都解析不出来**（写下去只会让 Hysteria 起不来）。
+	if res.Parsed == nil {
 		ack.Ok = false
-		ack.Error = "配置校验失败: " + joinErr(res.Errors)
+		ack.Error = "配置无法解析（YAML/结构错误）: " + joinErr(res.Errors)
 		ack.DurationMs = time.Since(started).Milliseconds()
 		a.m.ConfigApplyTotal.WithLabelValues("rejected").Inc()
 		a.m.ConfigApplySeconds.WithLabelValues("rejected").Observe(time.Since(started).Seconds())
 		a.recordVersion(payload, res, revision, format, source, reason, "rejected", ack.Error)
 		a.reportEvent("config_failed", 0, ack.Error, mustJSON(map[string]any{"checks": res.Checks, "errors": res.Errors}))
-		log.Error("拒绝下发配置", slog.String("revision", revision), slog.String("error", ack.Error))
+		log.Error("拒绝下发配置（无法解析）", slog.String("revision", revision), slog.String("error", ack.Error))
+
 		return ack
+	}
+
+	// 其余校验问题（证书路径不存在、secret 与 agent 不一致、端口被占…）**只作警告，仍写入** ——
+	// 与控制面的「以面板为准」原则、以及 CLI 的 `config sync` 保持一致。
+	// 这里曾是硬门禁，后果是节点永远不更新：控制面下发的正文与节点现状稍有不符就被拒收，
+	// 节点磁盘一直停在旧内容（真实现场：japan2 每 4 秒回执一次
+	// 「证书/私钥无法加载: open /etc/hysteria/cert.pem: no such file or directory」，配置永不更新）。
+	// 写下去的风险由后面的就绪检查 + 自动回滚兜底：起不来就恢复旧配置并上报原因。
+	if !res.Valid {
+		ack.Warnings = append(ack.Warnings,
+			fmt.Sprintf("校验有 %d 处问题，按「面板为准」仍写入: %s", len(res.Errors), joinErr(res.Errors)))
+		log.Warn("下发的配置有校验问题，按「面板为准」仍写入",
+			slog.String("revision", revision), slog.String("errors", joinErr(res.Errors)))
 	}
 	if dryRun {
 		ack.Ok = true

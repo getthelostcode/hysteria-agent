@@ -131,6 +131,7 @@ control:
   heartbeat_timeout_seconds: 20
   telemetry_interval_seconds: 5
   rest_fallback_seconds: 90
+  config_source: node        # 本用例测「按节点发布」这条线：不取版本文件库的默认版本
   config_poll_seconds: 3
   reconnect: { initial_seconds: 1, max_seconds: 5 }
 credentials_file: "$WORK/etc/agent/credentials.json"

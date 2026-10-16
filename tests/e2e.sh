@@ -242,15 +242,30 @@ check "配置历史记录了该版本" bash -c "grep -q '$REV1' '$WORK/etc/agent
 wait_for_q "state.json 里的 revision 已更新" "$STATE" config.revision "$REV1" 15
 wait_for_q "Hysteria 以新配置运行中" "$STATE" hysteria.running "true" 15
 
-log "3b) 非法配置必须被拒绝且不改动磁盘"
+log "3b) 解析不出配置的才拒收；其余校验问题按「面板为准」仍写入（带警告）"
 SHA_BEFORE=$(sha256sum "$WORK/etc/hysteria/config.yaml" | awk '{print $1}')
+# ① auth.type 非法：能解析（只是 Hysteria 起不来）→ 仍写入 + 回执带警告，由就绪检查/回滚兜底
 sed 's/type: password/type: nonsense/' "$WORK/push1.yaml" > "$WORK/push_bad.yaml"
 curl -sf -X POST --data-binary @"$WORK/push_bad.yaml" \
   "http://127.0.0.1:$CP_PORT/_test/push_config?revision=e2e-bad-1" >/dev/null
+sleep 4
+check "可解析但校验有问题的配置：仍写入（落盘，sha 变化）" bash -c "test \"$(sha256sum "$WORK/etc/hysteria/config.yaml" | awk '{print \$1}')\" != '$SHA_BEFORE'"
+check "该次回执不再是「拒收」（ok 不为 false 或带 warnings）" bash -c "dumpq where '$DUMP' configAck revision e2e-bad-1 | grep -qE '(\"ok\":\\s*true|warnings)' || dumpq last '$DUMP' config_ack revision | grep -q e2e-bad-1"
+
+# ② 连 YAML 都解析不出来的：必须拒收且不动磁盘（唯一的硬底线）
+BAD_YAML_BEFORE=$(sha256sum "$WORK/etc/hysteria/config.yaml" | awk '{print $1}')
+printf 'listen: [unclosed\n  : : :\n' > "$WORK/push_unparseable.yaml"
+curl -sf -X POST --data-binary @"$WORK/push_unparseable.yaml" \
+  "http://127.0.0.1:$CP_PORT/_test/push_config?revision=e2e-unparseable-1" >/dev/null
 sleep 3
-check "非法配置回执 ok=false" bash -c "dumpq last '$DUMP' config_ack ok | grep -qi false"
-check "非法配置未落盘（sha 未变）" test "$(sha256sum "$WORK/etc/hysteria/config.yaml" | awk '{print $1}')" = "$SHA_BEFORE"
+check "无法解析的配置未落盘（sha 未变）" test "$(sha256sum "$WORK/etc/hysteria/config.yaml" | awk '{print $1}')" = "$BAD_YAML_BEFORE"
+check "无法解析时回执 ok=false" bash -c "dumpq where '$DUMP' configAck revision e2e-unparseable-1 | grep -qiE '(\"ok\":\\s*false|rejected)'"
 check "上报了 config_failed 事件" bash -c "dumpq where '$DUMP' node_event type config_failed"
+
+# 把好配置推回去，让后续用例的磁盘状态干净
+curl -sf -X POST --data-binary @"$WORK/push1.yaml" \
+  "http://127.0.0.1:$CP_PORT/_test/push_config?revision=$REV1" >/dev/null
+sleep 3
 
 log "3c) 校验通过但服务起不来 → 必须自动回滚"
 REV_POISON="e2e-poison"
