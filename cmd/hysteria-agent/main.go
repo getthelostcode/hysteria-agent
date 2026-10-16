@@ -816,7 +816,7 @@ func cmdConfig(argv []string) int {
 	argv = normalizeConfigArgs(argv)
 
 	if len(argv) == 0 {
-		fmt.Fprintln(os.Stderr, "用法: hysteria-agent config <validate|history|rollback>")
+		fmt.Fprintln(os.Stderr, "用法: hysteria-agent config <sync|validate|history|rollback>")
 		return 2
 	}
 	switch argv[0] {

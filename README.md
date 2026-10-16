@@ -1,373 +1,80 @@
 # hysteria-agent
 
-Hysteria2 节点的**管理守护进程**：一条 WebSocket + Protobuf 长连接把节点接进控制面，负责注册、配置下发与热更新、进程守护、遥测上报、远程指令（含自升级与诊断）。
-
-> 协议与设计细节见 [DESIGN.md](DESIGN.md)；接口契约（消息表、指令参数、时序图）都在那里，本文偏使用与运维。
-
-## 它解决什么问题
-
-一台跑 Hysteria2 的节点机，运维上通常要面对：配置改了要上去手改、进程挂了没人拉、流量/负载看不到、要重启得 SSH、要升级得逐台登录。这个 Agent 把这几件事都收进控制面：
+Hysteria2 节点的**管理守护进程**：注册、守护、遥测、**配置下发与自动收敛**、远程指令、自升级 —— 一个静态二进制，装完就不用再登机器改配置。
 
 ```
-控制面 ──WSS(Protobuf)+HTTPS(JSON)──▶ hysteria-agent ──► Hysteria2 进程
-   ▲                                        │
-   └── 心跳 / 指标 / 日志 / 事件 / 指令结果 ──┘
+控制面/面板 ──WSS(Protobuf) + HTTPS(JSON)──▶ hysteria-agent ──▶ Hysteria2（含 systemd 那份）
+      ▲                                            │
+      └──── 心跳 / 指标 / 日志 / 事件 / 回执 ────────┘
 ```
 
 | 能力 | 一句话 |
 |---|---|
-| 注册与身份 | `enroll --token=…` 一次性换取 `node_id` + `node_secret`，存 `credentials.json`(0400)；之后用 `node_secret` 自签 JWT（或 mTLS）连接 |
-| 长连接 | 心跳 30s / 超时 90s；指数退避重连（上限 5 分钟）；**断线期间事件落盘，重连后按 seq 补发** |
-| 配置下发 | 五层校验（schema/端口/证书/一致性/引用）→ 原子写 `/etc/hysteria/config.yaml`(0600) → 热更新 → 失败自动回滚；保留最近 5 个版本 |
-| 进程守护 | `process`（Agent 直接拉起子进程）/ `systemd` / `external` 三种模式；崩溃退避重启、记录 exit code、窗口内超限则放弃并告警 |
-| 遥测 | 15s 上报 CPU/内存/磁盘/网络 + Hysteria 在线设备/活跃用户/流量/运行时长/版本；日志按采样率远程采集 |
-| 远程指令 | `reload_config`、`restart_hysteria`、`upgrade_agent`（ed25519 验签+原子替换）、`run_diagnostic`、`tail_logs`（限时 5 分钟）、`kick_users`、`get_state`、`rollback_config`、`cancel_tail`、`self_restart`、`clear_outbox` |
-| 安全 | 出站 TLS + SPKI 证书 pinning；配置 0600 / 凭据 0400；升级强制验签；**只执行白名单指令，永不 `sh -c` 任意命令** |
-| 可观测 | 结构化 JSON 日志（ts/level/node_id/component/msg/trace_id）；`127.0.0.1:9100` 的 `/metrics`、`/healthz`、`/readyz` |
+| 注册与身份 | `enroll --token=…` 一次性换取 `node_id` + `node_secret` → `credentials.json`(0400)；之后用 `node_secret` 自签 JWT 连控制通道 |
+| 控制通道 | 心跳 30s / 超时 90s 判离线；指数退避重连（上限 5 分钟）；断线期间事件落盘、重连按 seq 补发（at-least-once） |
+| **配置下发** | 控制面是权威：按 **sha256** 判断本机内容与面板是否同一份，不一致就取回 → 校验 → 快照 → 原子写 0600 → **重启 Hysteria** → 回执；起不来自动回滚，保留最近 5 个版本 |
+| 进程守护 | `systemd`（管现有 `hysteria-server`）/ `process`（自己拉起）/ `external`（只观测）；崩溃退避重启、窗口限流后放弃并上报 |
+| 遥测 | 15s 上报 CPU/内存/磁盘/网络 + Hysteria 在线用户/流量/运行时长/版本；日志按采样率远程采集 |
+| 远程指令 | `reload_config` / `restart_hysteria` / `rollback_config` / `run_diagnostic` / `tail_logs`（≤5 分钟）/ `kick_users` / `get_state` / `upgrade_agent` / `self_restart` / `cancel_tail` / `clear_outbox` |
+| 安全 | 出站 TLS + SPKI pinning；配置 0600 / 凭据 0400；升级强制 ed25519 验签；**只执行白名单指令，永不 `sh -c`** |
+| 可观测 | JSON 日志（`ts/level/node_id/component/msg/trace_id`）+ `127.0.0.1:9100` 的 `/metrics` `/healthz` `/readyz` |
 
-与同仓库/同系列的早期组件 `hysteria-node-agent`（只做"拉踢人列表 + 上报流量"的最小脚本）不同：本程序是**常驻守护 + 双向控制通道**形态，能管进程、管配置、管升级。
+> 协议与设计细节见 [DESIGN.md](DESIGN.md)；控制面最小契约见 [附录 A](#附录-a控制面最小契约)；
+> 与 Laravel 面板的桥接见 [docs/BRIDGE-TO-CONTROL-PLANE.md](docs/BRIDGE-TO-CONTROL-PLANE.md)。
 
-## 环境要求
+## 目录
 
-* 节点机：Linux（systemd 推荐）；root 或等价权限
-* Hysteria 2 服务端（Agent 可以代为安装/守护，也可以只管已有的实例）
-* 控制面：**本仓库自带一份可直接上线的实现**（`bin/controlplane`，见下节）；也可以自己实现，只要满足 [DESIGN.md §5.1](DESIGN.md) 的三个接口（`cmd/mockcontrol` 是 200 行的最小参考实现）
+- [1. 快速开始](#1-快速开始)
+- [2. 运行机制](#2-运行机制)
+- [3. 配置下发与同步](#3-配置下发与同步)
+- [4. agent 怎么管 Hysteria](#4-agent-怎么管-hysteria)
+- [5. 鉴权：默认 HTTP](#5-鉴权默认-http)
+- [6. 安装 / 升级 / 回退 / 卸载](#6-安装--升级--回退--卸载)
+- [7. 安全](#7-安全)
+- [8. 可观测](#8-可观测)
+- [9. 配置参考](#9-配置参考)
+- [10. 排错](#10-排错)
+- [11. 测试与验证](#11-测试与验证)
+- [12. 目录结构与开发](#12-目录结构与开发)
 
+## 1. 快速开始
 
-### 装完/更新完立刻用上面板里的配置
+**环境要求**：节点机 Linux（systemd 推荐）、root 或等价权限；Hysteria 2 服务端（agent 可以代为安装/守护，也可以只管已有实例）；控制面满足 [附录 A](#附录-a控制面最小契约) 的三个接口即可（本仓库自带完整实现，见 [附录 C](#附录-c自带控制面--桥接--反代)）。
 
-`install.sh` 第 5 步会跑 `hysteria-agent config sync`：把控制面上**最新发布的**配置直接同步到
-`hysteria.config_path`（默认 `/etc/hysteria/config.yaml`），不用等 agent 起来轮询。
-
-```bash
-sudo -E bash install.sh https://node.ipx.sarl --skip-enroll   # 升级 agent 的同时把配置拉到最新
-```
-
-* **语义：跑完，本机 `hysteria.config_path` 就是控制面上最新发布的那一份**。每次都取回最新正文，
-  与磁盘内容按 **sha256** 比对（不是比版本号）：
-  * 内容一致 → 明确说「已是最新配置（与面板 vN 内容一致）」并且**不动**文件（幂等）；
-  * 内容不一致 → **以面板为准写下去**（原子写 0600 + 留历史快照）。校验发现的问题
-    （证书路径不存在、`trafficStats.secret` 与 api_secret 不一致等）作为**警告**打印，
-    但不拦着；只有连语法都解析不出配置才拒绝。想恢复「校验不过就不写」用 `--strict`；
-  * 面板还没发布过配置 → 说明并**不动**本地文件；
-* 新配置**先校验再写**：不过就保持现有文件不动（宁可不同步，也不能把能用的配置换坏），
-  写入前会存历史快照，回滚：`hysteria-agent config history|rollback`；
-* 控制面不可达不会让安装失败，只 WARN；
-* 不想同步：`--no-sync-config`；
-* 运维手工同步（先看会写什么）：
+### 1.1 一键安装（推荐）
 
 ```bash
-hysteria-agent config sync --dry-run     # 只拉取 + 校验 + 打印
-hysteria-agent config sync               # 落盘（0600，原子写，留历史）
-hysteria-agent config sync --reload      # 落盘后顺带重启被守护的 Hysteria（mode: systemd）
+# 节点机上（root）：装 agent + Hysteria、生成配置、装 systemd 单元、注册、并把面板最新配置同步下来
+sudo -E bash install.sh https://node.ipx.sarl --token=<面板签发的一次性令牌> --name=hk-node-1
+
+# 升级 / 只同步（节点已在面板里）
+cd ~/hysteria-agent && git pull && sudo -E bash install.sh https://node.ipx.sarl --skip-enroll
 ```
 
-**心跳里上报「实盘配置身份」**：每次 REST 心跳带上本机 `/etc/hysteria/config.yaml` 的
-`config_version` / `config_sha256` / `config_path` —— 面板节点列表的「配置版本」以它为准。
-只有文件与某条历史记录**逐字节一致**时才报版本号（`config_source` 取到的是哪一版就是哪一版），
-被手工改过就报版本 0 + 实际 sha256，面板显示「未识别」，不会拿期望版本糊上去。
+常用参数（完整表见 [6.1](#61-installsh-参数与环境变量)）：
 
-**取哪一份配置（`--source`）**
-
-| 来源 | 含义 |
-| --- | --- |
-| `default`（`config sync` 的默认） | 「配置管理 → 版本管理」里那份**默认版本文件**（`config_files.is_default`），与节点无关 |
-| `node` | **本节点**发布的第几版（`node_configs.is_current`） |
-
-* 守护进程的兜底轮询默认按 `node`（保持原行为）；想让它也跟文件库走，在 agent 配置里写
-  `control.config_source: default`；
-* 命令行可临时覆盖：`hysteria-agent config sync --source node`；
-* 按文件库同步时节点回执的版本号在本节点没有对应行，控制面会**补记一条**（`config.applied_from_library`），
-  所以节点的应用历史仍然完整；
-* **文件库里还没有默认版本时自动退回「本节点发布的版本」**并如实打印来源 —— 否则会出现
-  「面板明明发布了配置、节点一无所获」（install.sh 装完不更新就是这么来的）；
-* install.sh 的第 5 步同步可用 `SYNC_CONFIG_SOURCE=node` 指定按节点版本取；
-* `--dry-run` 输出也会标明来源。
-
-回归：`bash tests/install_sync_e2e.sh`（16 项断言，跑**真的 install.sh**：装完→发布新版本→再跑一次→
-磁盘自动跟上；`--no-sync-config` 跳过；已是最新不重复写）。
-
-### 更新节点：装到的必须是新构建
-
-`install.sh` 优先用仓库里入库的发布产物 `dist/hysteria-agent-linux-<arch>`。**只 `git pull` 不会更新它**，
-所以会出现「代码是新的、行为是旧的」（真实现场：装到 12:52 那份还没有配置轮询的构建，于是面板发布的配置
-永远停在 `published`）。现在 install.sh 会：
-
-* 比较 `dist/` 二进制与仓库里最新 `.go` 的修改时间；**源码更新 → 直接用当前源码重新构建**（`go build`，ldflags 带真实 commit）；
-* 没有 Go 工具链时**明确 WARN**（告诉你在有 Go 的机器上 `make build` 后重跑），而不是静默装旧的；
-* 安装后打印构建信息（`hysteria-agent 0.1.0 (<commit>, <time>)`）—— 到节点上对一下就知道装的哪一版。
-
-回归：`bash tests/install_binary_freshness_test.sh`（10 项断言，含「用 go shim 验证确实走了源码重建」）。
-
-### 自动跟上面板的「默认版本」（改完默认版本，节点自己更新并重启 Hysteria）
-
-守护进程默认就按「配置版本文件库的默认版本」收敛（`control.config_source` 留空 = `default`）：
-
-0. **校验不当门禁**（与 CLI 的 `config sync` 一致）：配置能解析出来就**照面板写的写**，
-   证书路径不存在、secret 与 agent 不一致、端口被占这类问题只作**警告**（写进回执与日志）；
-   只有「连 YAML 都解析不出来」才拒收。写坏了由就绪检查 + 自动回滚兜底。
-   这条曾经是硬门禁，后果是节点**永远不更新**（真实现场：japan2 每 4 秒回执一次
-   `证书/私钥无法加载: open /etc/hysteria/cert.pem: no such file or directory`，磁盘一直停在旧内容）。
-1. 每 `control.config_poll_seconds`（默认 5s）拉一次 `/api/v1/agent/config/default`，带上本机文件的
-   `current_version` 与 `current_sha256`；
-2. 控制面按 **sha256** 判断「是不是同一份内容」—— 不一致就下发正文（库里没有默认版本时自动退回
-   「本节点发布的版本」，不会一无所获）；
-3. 节点侧：校验 → 留历史快照 → 原子写 0600 → **重启被守护的 Hysteria**（process 模式 SIGTERM 优雅停止后
-   用新配置拉起；systemd 模式先 `systemctl reload`，不可用则 restart）→ 回执 `applied` 给面板；
-   起不来则自动回滚并如实上报原因。
-
-于是运维只需要在面板「配置管理 → 版本管理」里改一次默认版本（下拉 + 保存），各节点就会自己更新并重启。
-不想让它跟文件库走，就写 `config_source: node`（按本节点发布的第几版）或 `config_source: ""`…… 注意
-守护进程默认就是 `default`，要恢复旧行为请显式写 `config_source: node`。
-
-端到端验证：`bash tests/auto_converge_e2e.sh`（真 agent + mock 控制面 + mock Hysteria，断言两轮收敛
-「本机不一致 → 自动更新为默认版本 → 重启 Hysteria」，以及面板改默认版本后再跟一轮）。
-
-## 克隆镜像与 machine_id
-
-控制面按 `machine_id` 认节点：**克隆出来的 VPS 镜像 machine-id 相同**，两台会互相顶掉注册
-（面板里只留得下一台）。给每台机器一个固定值即可：
-
-```yaml
-enroll:
-  machine_id: "jp8-ip2-one"      # 或临时：HYSTERIA_AGENT_MACHINE_ID=xxx hysteria-agent enroll …
-```
-
-## 版本标识与「回到某一版」
-
-* 二进制的版本标签 = **最后改动 agent 源码的那个提交**（不是打包提交）：打包/文档提交一行代码没改，
-  却会让源码重建出来的二进制自报另一个 commit —— 同一份代码两个身份，事后对账全是问号。
-  源码有未提交改动时标签带 `-dirty`。
-* 仓库里的发布产物旁边有 `.commit`（构建来源提交）和 `.sha256`；`install.sh` 按 `.commit` 判断
-  「发布产物是不是过期」，不再因为一次 `git pull` 的 mtime 变化就重建。
-* 安装来源优先级：`AGENT_BINARY` > `dist/`（发布产物）> `release/` 包 > `bin/`（本机遗留构建，最后）。
-  真实现场：本机遗留的 `bin/hysteria-agent`（几周前的 `d4482cd`）曾把发布产物顶掉，装出来还是旧的。
-* 重打发布产物：`make dist` 或 `bash scripts/release-dist.sh`（编译 + `.sha256` + `.commit`）。
-
-**回到指定发布版本**（例如 `hysteria-agent 0.1.0 (61145e9, …)`）：
-
-```bash
-cd ~/hysteria-agent && git pull
-git log --oneline -5 -- dist/hysteria-agent-linux-amd64        # 找那一版的打包提交
-git checkout <打包提交> -- dist/hysteria-agent-linux-amd64 \
-    dist/hysteria-agent-linux-amd64.sha256 dist/hysteria-agent-linux-amd64.commit
-sudo -E bash install.sh https://node.ipx.sarl --skip-enroll --no-rebuild   # 原样装这一版
-hysteria-agent version                                          # 应显示 (61145e9, …)
-```
-
-* `--no-rebuild`：只用现成产物、**绝不**源码重建（版本可复现；本机没 Go 工具链时也必须加）。
-* 不加 `--no-rebuild`：`.commit` 与当前源码提交不一致 → 自动源码重建，标签 = 源码提交。
-
-## 配置下发也是 REST 兜底（面板「发布配置」靠它生效）
-
-控制通道 501（Laravel 终结不了二进制 WS）时，agent 不只在 REST 里发心跳，还会**轮询配置**：
-
-| 端点 | 作用 |
-| --- | --- |
-| `GET /api/v1/agent/config/latest?current_version=N` | 取最新配置（`content_yaml` + `sha256`），`up_to_date` 表示已是最新 |
-| `POST /api/v1/agent/config/ack` | 回执 `{version, status: applied\|failed, error}` |
-
-* 间隔由 `control.config_poll_seconds`（默认 5s）控制；把 `control.rest_config_path` 指到别的路径可自定义。
-* 拿到新版本走的是**同一条应用管线**：校验 → 快照 → 原子写（0600）→ 热重载 → 失败自动回滚，回执再经 REST 送回。
-* 没有这两个端点时，面板「发布配置」只会写进库（`published`），节点永远拿不到 —— 真实现场就是所有配置
-  `applied_at` 恒为空、节点上 `/etc/hysteria/config.yaml` 一动不动。
-* 回归：`PANEL_URL=http://127.0.0.1:8001 bash tests/rest_config_e2e.sh`（19 项断言：发布生效 / 面板变 applied /
-  坏配置被拒 + 自动回滚，全程真实 agent ↔ 真实 Laravel）。
-
-### Hysteria 鉴权：默认 HTTP，已有节点可单独换
-
-静态密码（`auth.type: password`）写在节点上，用户离开平台后依然能连，也没法按流量/到期回收。
-所以生成的配置默认走 **HTTP 鉴权**：
-
-```yaml
-auth:
-  type: http
-  http:
-    url: https://auth.ipx.sarl    # HYSTERIA_AUTH_URL
-    insecure: false               # HYSTERIA_AUTH_INSECURE=1 才跳过证书校验
-```
-
-* 新装：`install.sh` 生成配置时就用上面这段；想保留老行为设 `HYSTERIA_AUTH_MODE=password`。
-* **已有节点**：`install.sh` 默认**不动**已有配置（只读它的 trafficStats），要换鉴权必须显式：
-  ```bash
-  sudo bash scripts/set-hysteria-auth-http.sh https://auth.ipx.sarl   # 只改 auth 段，自动备份 + 重启
-  # 或 sudo bash install.sh https://node.ipx.sarl --set-hysteria-auth --hysteria-auth-url https://auth.ipx.sarl
-  ```
-  两种方式都只替换顶层 `auth` 段，证书 / `masquerade` / `trafficStats` 一字不动。
-  ⚠️ 切之前先确认鉴权后端可用，否则**所有用户都连不上**：
-  `curl -si -X POST -H 'Content-Type: application/json' -d '{"addr":"1.2.3.4:1","auth":"a:b","tx":0,"rx":0}' https://auth.ipx.sarl/auth`
-  → 期望 200 + `{"ok":false,"id":""}`。
-* 回归：`bash tests/hysteria_auth_http_test.sh`（30 项断言，含「两份实现输出一致」的防漂移断言）。
-
-### 控制通道不可用时的 REST 兜底心跳
-
-控制通道是二进制 protobuf WebSocket；**Laravel/PHP 一类的控制面终结不了它**（返回 501）。
-这时 agent 不再盲目重试，而是降级为定时 POST `control.rest_heartbeat_path`
-（默认 `/api/v1/agent/heartbeat`），让面板的「最后心跳」与在线状态保持真实：
-
-* 只处理 404/405/501 —— 认证失败（401/403）不会降级，避免掩盖凭据问题；
-* 持续 `control.rest_fallback_seconds`（默认 300s）后重新尝试控制通道，
-  控制面换成能终结 WS 的实现后最迟一个窗口自动恢复；
-* 指标/日志目前仍走控制通道（REST 兜底只补心跳，见 docs/BRIDGE-TO-CONTROL-PLANE.md）；
-* 观测：`hysteria_agent_rest_heartbeats_total` / `hysteria_agent_rest_heartbeat_failures_total`。
-
-真机验证：`PANEL_URL=http://127.0.0.1:8001 bash tests/rest_fallback_e2e.sh`（9 项断言，
-含「最后心跳持续前移」）。
-
-## 桥接模式（身份由 Laravel 控制面签发）
-
-让本仓库的 Go 控制面只终结 agent 的 Envelope 通道，**身份/数据全部落在 Laravel 控制面**
-（面板是唯一 UI/审计/权限源）。设计见 `docs/BRIDGE-TO-CONTROL-PLANE.md`。
-
-```yaml
-# /etc/hysteria-controlplane/config.yaml
-identity:
-  authority: "laravel"
-laravel:
-  base_url: "https://cp.example.com"     # Laravel 控制面（面板所在站点）
-  enroll_path: "/api/v1/agent/enroll"
-poll: { config_seconds: 2, commands_seconds: 10, fallback_only: true }
-reverb: { enabled: true, key: "<REVERB_APP_KEY>", host: "cp.example.com", port: 443, scheme: "https" }
-```
-
-```bash
-controlplane serve -config /etc/hysteria-controlplane/config.yaml   # 启动时会探活 Laravel
-hysteria-agent enroll --token=<面板生成的一次性令牌>                 # 走本控制面即可
-```
-
-* 注册被**原样代理**到 Laravel：返回的 `node_id` / `node_secret` 就是 Laravel 下发的，
-  面板立刻能看到该节点（同一个 `node_id`）；`401/409` 等状态码与响应体原样透传。
-* 心跳 / 遥测 / 日志 / 诊断报告由控制面**转发**到 Laravel（`POST /api/agent/v1/{heartbeat,metrics,logs,diagnostics}`）：
-  agent 只跟控制面打交道，队列表格/曲线/日志全部落在面板侧。转发走 per-node 后台队列，
-  agent 的消息处理路径永不阻塞（丢弃/失败都进 `/metrics` 的 `cp_bridge_*` 计数）。
-
-真机验收（需要 Laravel 面板在跑）：
-
-```bash
-PANEL_URL=http://127.0.0.1:8001 bash tests/bridge_e2e.sh     # 14 项断言
-```
-* 本控制面把 per-node secret 存进 `state.json`（0600），用于替节点签 REST（S4 起）。
-* 老的独立模式（`authority: local`，node_secret 由 master_key 派生）保持可用，升级后行为不变。
-* 自检：`go run ./cmd/cpapi-smoke -cp https://cp.example.com -email <admin> -password <pw>`
-
-## 控制面（内置，开箱可用）
-
-控制面不需要你自己写：`cmd/controlplane` 是完整实现——节点注册、控制通道、配置下发、指令下发、事件归档、指标、只读仪表盘。
-
-```bash
-# 在控制面那台机器上（仓库根目录）
-bash install-controlplane.sh --public-url https://cp.example.com
-#   → 装二进制 + 生成 0600 配置（随机 admin_token 与主密钥）+ systemd 起服务 + 现场验证
-#   → 输出 admin_token（只显示这一次，请保存）
-
-controlplane token new --name hk-node-1     # 生成一次性注册令牌
-controlplane nodes                          # 节点列表（在线/离线/配置状态/遥测）
-controlplane node <node_id>                 # 单节点详情
-controlplane push-config <node_id> /etc/hysteria/config.yaml --reason "调 masquerade" --wait 25s
-controlplane command <node_id> run_diagnostic
-controlplane events <node_id> --limit 50
-controlplane delete-node <node_id>          # 吊销（node_secret 由主密钥派生，删记录即失效）
-```
-
-对外只需要暴露两个路径（WebSocket 要转发 `Upgrade`/`Connection` 头）：
-
-| 路径 | 说明 |
+| 参数 | 作用 |
 |---|---|
-| `POST /api/v1/agent/enroll` | 注册（一次性令牌 → `node_id` + `node_secret`） |
-| `GET /api/v1/agent/control` | 控制通道（WebSocket，`Authorization: Bearer <本机自签 JWT>`） |
+| `--token=<T>` / `--name=<N>` | 一次性注册令牌 / 节点名（默认主机名） |
+| `--skip-enroll` | 只装/升级，不重新注册 |
+| `--hysteria-mode=auto\|systemd\|process\|external` | agent 怎么管 Hysteria（默认 `auto`，见 [§4](#4-agent-怎么管-hysteria)） |
+| `--no-sync-config` / `SYNC_CONFIG_SOURCE=node` | 不跑「装完同步配置」/ 指定同步来源 |
+| `--verify-only` | 只巡检，不改任何文件（退出码非 0 表示有问题） |
+| `--no-rebuild` | 只用现成发布产物，绝不源码重建（版本可复现） |
+| `--uninstall` | 卸载 agent（Hysteria 本身不动） |
 
-Cloudflare Tunnel（控制面在隧道后面时，`cloudflared` 的 ingress 支持按 path 匹配，可与已有站点共存）：
-
-```yaml
-# ~/.cloudflared/config.yml
-tunnel: <tunnel-id>
-credentials-file: /root/.cloudflared/<tunnel-id>.json
-ingress:
-  - hostname: node.ipx.sarl
-    path: /api/v1/agent/.*
-    service: http://127.0.0.1:8443      # 控制面（WS 走同一路径，cloudflared 自动转发 Upgrade）
-  - hostname: node.ipx.sarl
-    service: http://127.0.0.1:8080      # 你原有的面板/站点
-  - service: http_status:404
-```
-
-nginx 反代（等价写法）：
-
-```nginx
-location ~ ^/api/v1/agent/ {
-    proxy_pass http://127.0.0.1:8443;
-    proxy_http_version 1.1;
-    proxy_set_header Upgrade $http_upgrade;
-    proxy_set_header Connection "upgrade";
-    proxy_read_timeout 3600s;           # 控制通道是长连接
-    proxy_set_header X-Node-ID $http_x_node_id;
-}
-```
-
-管理侧接口（`Authorization: Bearer <admin_token>`）：`GET /admin/nodes`、`GET /admin/nodes/{id}`、`POST /admin/nodes/{id}/config`、`POST /admin/nodes/{id}/commands?type=…`、`GET /admin/nodes/{id}/events`、`GET /admin/nodes/{id}/telemetry`、`POST /admin/tokens`、`DELETE /admin/nodes/{id}`、`DELETE /admin/tokens/{token}`。浏览器打开 `/` 是只读仪表盘（令牌存 localStorage，不发 cookie）。
-
-设计要点（安全与幂等）：
-
-* **不保存共享密钥**：`node_secret = HMAC-SHA256(master_key, "node_secret:"+node_id)`，控制面只存 `node_id`；删除节点记录 = 立即吊销。`master_key` 在 `state_dir/master.key`（0600）或配置里。
-* **投递 at-least-once + 幂等**：按 `(node_id, seq)` 去重（跨连接也比对持久化的 `acked_seq`），重复消息只计数不重复入库，但仍回 `EventAck` 让 Agent 的 outbox 前进。
-* **配置下发的确认链**：`ConfigPush(revision, sha256)` → `ConfigAck`；控制面按 revision 幂等重发（30s 一次，最多 20 次），上线后若仍有未确认下发会自动补发。
-* 状态全在 `state_dir`：`state.json`（0600，节点/令牌/待确认配置）+ `events/<node>.jsonl`（0600，按上限裁剪）。
-
-## 快速开始
-
-### 方式 0：用编译好的发布包（最快）
-
-仓库里已经带了编译好的静态二进制包（无需装 Go）：
+### 1.2 用发布包（目标机没装 Go）
 
 ```bash
-# 1) 取包（仓库里就有）：release/hysteria-agent-0.1.0-linux-<amd64|arm64>.tar.gz
-tar -xzf hysteria-agent-0.1.0-linux-amd64.tar.gz
-cd hysteria-agent-0.1.0-linux-amd64
-
-# 2) 校验完整性（包内另有一份 bin/* 的 SHA256SUMS）
-sha256sum -c ../SHA256SUMS      # 校验 tarball 本身
+tar -xzf hysteria-agent-0.1.0-linux-amd64.tar.gz && cd hysteria-agent-0.1.0-linux-amd64
+sha256sum -c ../SHA256SUMS      # 校验 tarball
 sha256sum -c SHA256SUMS         # 校验包内二进制
-
-# 3) 一键安装（脚本会自动发现同包内的 bin/hysteria-agent）
-bash install.sh https://cp.example.com --token=<enroll_token> --name=hk-node-1
-
-# 4) 看一眼状态
-./bin/hysteria-agent status
-./bin/hysteria-agent diag
-curl -s 127.0.0.1:9100/healthz && curl -s 127.0.0.1:9100/readyz
+bash install.sh https://node.ipx.sarl --token=<T> --name=hk-node-1
 ```
 
-包内包含：`bin/{hysteria-agent,controlplane,mockcontrol,mockhysteria,agent-sign}`（全部静态链接，`CGO_ENABLED=0`）、
-`install.sh`、`deploy/{config.yaml,hysteria-agent.service}`、`README.md`、`DESIGN.md`。
+包内含 `bin/{hysteria-agent,controlplane,mockcontrol,mockhysteria,agent-sign}`（`CGO_ENABLED=0` 静态链接）、`install.sh`、`deploy/`、`README.md`、`DESIGN.md`。
 
-需要自己重新构建发布包时：
-
-```bash
-make release                       # 产出 release/*.tar.gz（amd64 + arm64）+ SHA256SUMS
-make UPGRADE_PUBKEY=<base64 公钥> release   # 把自升级验签公钥编进二进制
-make smoke-release                 # 用发布包里的二进制真跑一遍（28 项断言）
-```
-
-### 方式 1：一键安装（推荐）
-
-```bash
-# 1) 在节点机上（脚本会自己装 Hysteria、生成配置、装 systemd 单元、注册节点）
-bash install.sh https://cp.example.com --token=<enroll_token> --name=hk-node-1
-
-# 常用参数
-#   --no-hysteria        不动 Hysteria（外部已装好）
-#   --hysteria-config P  指定 Hysteria 配置路径（默认 /etc/hysteria/config.yaml）
-#   --skip-enroll        只装不注册
-#   --verify-only        只做巡检，不改任何文件
-#   --uninstall          卸载（Hysteria 本身不动）
-#
-# 关键环境变量
-#   HYSTERIA_DOMAIN / HYSTERIA_ACME_EMAIL   有域名就用 ACME，否则自签证书
-#   UPGRADE_PUBKEY                          自升级验签公钥（不给则关闭自升级）
-#   AGENT_BINARY / AGENT_BINARY_URL         二进制来源
-```
-
-### 手动安装
+### 1.3 手动安装
 
 ```bash
 make build                                  # 产出 bin/hysteria-agent
@@ -380,127 +87,417 @@ install -m0644 deploy/hysteria-agent.service /etc/systemd/system/
 systemctl daemon-reload && systemctl enable --now hysteria-agent
 ```
 
-### 常用命令
+### 1.4 装完怎么确认
 
 ```bash
-hysteria-agent status [--json]     # 运行状态（读 state.json + 本地端点 + systemd）
-hysteria-agent diag [--json]       # 12 项健康检查：端口/证书/DNS/出口 IP/控制面/API/磁盘/时钟…
-hysteria-agent restart             # 重启 Agent（--hysteria-only 只重启 Hysteria）
-hysteria-agent config history      # 配置历史（最近 5 个版本）
-hysteria-agent config rollback --rev=<revision>
-hysteria-agent config validate -f /tmp/new-config.yaml
-hysteria-agent upgrade --url=… --sha256=… --signature=…   # 手动升级（同样强制验签）
-hysteria-agent version
-curl -s 127.0.0.1:9100/metrics | head      # Prometheus
-curl -s 127.0.0.1:9100/readyz              # 就绪检查
+hysteria-agent version                    # 版本 + 构建提交 + 时间（对账用）
+hysteria-agent status [--json]            # 运行态（读 state.json + 本地端点）
+hysteria-agent diag [--json]              # 12 项健康检查：端口/证书/DNS/出口 IP/控制面/API/磁盘/时钟…
+curl -s 127.0.0.1:9100/healthz; curl -s 127.0.0.1:9100/readyz; curl -s 127.0.0.1:9100/metrics | head
 ```
 
-## 配置表
+面板上应能看到：节点在线、「最后心跳」持续前移、「配置版本」= 它**实盘那份**配置对应版本管理里的第几版（见 [3.5](#35-节点把实盘配置报给面板)）。
 
-`/etc/hysteria-agent/config.yaml`（0600）。下划线项为默认值，最小配置只需要 `control.server_url`。
+## 2. 运行机制
+
+| 周期 | 默认 | 说明 |
+|---|---|---|
+| 心跳 | 30s（超时 90s 判离线） | 控制面可在 `HelloAck` 里覆盖 |
+| 遥测 | 15s | CPU/内存/磁盘/网络 + Hysteria 用户与流量 |
+| **配置轮询** | 5s（`control.config_poll_seconds`） | 控制通道不可用时走 REST；带上本机 `current_sha256` 由控制面判定 |
+| 日志采集 | 采样 ≤200 行/s（突发 500） | 环形缓冲 2000 行，`tail_logs` 回放 |
+
+**配置闭环**（面板改一次，节点自己跟上）：
+
+```
+面板改默认版本 / 发布新版本
+        │
+        ▼
+agent 每 5s：GET /api/v1/agent/config/default?current_version=N&current_sha256=<本机文件 sha>
+        │        （库里没有默认版本时自动退回「本节点发布的版本」）
+        ▼
+控制面按 sha256 判定「是不是同一份内容」──一致──▶ 什么都不做（幂等）
+        │不一致
+        ▼
+下发正文 → 节点：校验（问题只作警告）→ 留历史快照 → 原子写 0600
+        → 重启 Hysteria（systemd：systemctl restart hysteria-server；process：SIGTERM 优雅停止后拉起）
+        → 就绪检查 → 回执 applied
+        └── 起不来 → 自动回滚到上一版 + 回报失败原因（含 Hysteria 最后几行输出）
+```
+
+**可靠性语义**
+
+* **at-least-once**：`seq>0` 的消息先写 outbox（fsync）再发，控制面累积确认后才删；重连从 `resume_from_seq` 补发。控制面必须按 `(node_id, seq)` 幂等入库。
+* **配置热更新 = 优雅重启**：Hysteria 2 只处理 `SIGINT/SIGTERM`（没有 SIGHUP），所以是「优雅停止 → 以新配置拉起」，断连窗口 ≈ 进程启动时间，客户端会自动重连。不做「假装支持热重载」的封装（见 [DESIGN.md §4.2](DESIGN.md)）。
+* **`/readyz` 语义** = `Hysteria 在跑 && 配置已应用`；控制通道断开**不会**让它 not ready（已连接的用户还在用，控制面靠心跳超时判离线）。
+* **踢人 ≠ 封禁**：`kick_users` 只调 Hysteria `/kick`，客户端会自动重连；真正阻断要在认证后端把用户禁用。
+* **REST 降级只认 404/405/501**（对端没实现该端点）；`401/403` **不会**降级 —— 那是确定的凭据问题，降级只会把它掩盖掉。
+
+## 3. 配置下发与同步
+
+### 3.1 两份来源，取哪一份是显式开关
+
+| 来源 | 含义 | 谁默认用它 |
+|---|---|---|
+| `default` | 「配置管理 → 版本管理」里那份**默认版本文件**（与节点无关，全部节点共用同一份正文） | `config sync`（CLI）与守护进程（`control.config_source` 默认 `default`） |
+| `node` | **本节点**发布的第几版 | 显式 `config_source: node` / `--source node` |
+
+* `control.config_source` 留空 = 不指定，由调用方决定默认值；
+* **库里还没有默认版本时自动退回 `node`** 并如实打印来源 —— 否则会出现「面板明明发布了配置、节点一无所获」；
+* 节点按文件库同步时，回执里的版本号在 `node_configs` 里没有对应行，控制面会补记一条（审计 `config.applied_from_library`），节点历史仍然完整；
+* 命令行临时覆盖：`hysteria-agent config sync --source node`。
+
+### 3.2 判定按 sha256，不按版本号
+
+每次同步都取回**最新正文**与磁盘文件比 sha256：一致 → 明确说「已是最新（与面板 vN 内容一致）」且**不写盘**；不一致 → 写。
+版本号只是控制面的记账，会被「被拒绝的版本」「就地改过的正文」「手工改过的文件」「回滚过的状态」骗过。
+「本机当前是哪一版」同样按**文件哈希与历史记录精确匹配**，匹配不到就按未知处理（取最新正文重写并说明原因），绝不退回「最新一条记录」。
+
+### 3.3 校验只作警告 + 自动回滚
+
+* **唯一的硬底线是「连 YAML/结构都解析不出来」** —— 那才拒收（写下去只会让 Hysteria 起不来）。
+* 其余问题（证书/私钥路径不存在、`trafficStats.secret` 与 `hysteria.api_secret` 不一致、端口被占…）**只作警告**，写进日志与回执，**仍然以面板为准写入**，由写后就绪检查 + 自动回滚兜底。
+  > 这条曾经是硬门禁，后果是节点**永远不更新**：控制面下发的正文与节点现状稍有不符就整份拒收，磁盘一直停在旧内容（真实现场：节点每 4 秒回执一次 `证书/私钥无法加载: open /etc/hysteria/cert.pem: no such file or directory`）。
+* 想恢复「不过就不写」：`config sync --strict`（CLI）或 `--strict-sync-config`（install.sh）。
+* **自动回滚的三道护栏**（防止「失败 → 回滚 → 再失败」变成版本风暴）：① 最新版本已是回滚目标内容（sha256 一致）→ 跳过；② 同一节点 10 分钟内自动回滚 ≥3 次 → 跳过（判定为环境问题）；③ 回滚目标与失败版本 sha256 相同 → 跳过。
+  跳过时审计 `config.auto_rollback_skipped`，节点置 `error`，错误留在面板上让人去修。
+
+### 3.4 手工同步 / 历史 / 回滚 / 校验
+
+```bash
+hysteria-agent config sync --dry-run     # 只拉取 + 校验 + 打印会写什么（含来源）
+hysteria-agent config sync               # 落盘（0600，原子写，留历史）
+hysteria-agent config sync --reload      # 落盘后顺带重启被守护的 Hysteria
+hysteria-agent config sync --source node # 临时按「本节点发布的版本」取
+hysteria-agent config history            # 历史快照（默认保留 5 个）
+hysteria-agent config rollback [-rev=<revision>]
+hysteria-agent config validate -f /tmp/new.yaml
+```
+
+`install.sh` 的第 5 步就是跑一次 `config sync`：**装完/升级完，本机配置立刻就是面板上那一份**（已是最新则不动文件；面板不可达只 WARN，不算安装失败）。不想同步用 `--no-sync-config`。
+
+### 3.5 节点把「实盘配置」报给面板
+
+每次心跳带上本机 `/etc/hysteria/config.yaml` 的 `config_version` / `config_sha256` / `config_path`，控制面收养进节点元数据。
+面板的「配置版本」列**按 `config_sha256` 反查版本号**（① 版本管理里 sha 命中 → ② 该节点历史里 sha 命中 → ③ 都没命中才退回自报版本号并注明）；只有文件与某条记录**逐字节一致**时才报版本号，被手工改过就报 0 + 实际 sha256，面板显示「未识别」，**不拿面板的期望版本糊上去**。
+
+## 4. agent 怎么管 Hysteria
+
+| `hysteria.mode` | 行为 | 适用 |
+|---|---|---|
+| `systemd` | Hysteria 由 systemd 管理；agent 只调白名单动词，配置更新后 **`systemctl restart <service>`** | 本机已有 `hysteria-server.service`（install.sh 默认自动选中） |
+| `process` | agent 直接拉起/守护 `hysteria` 子进程 | 没有 systemd 单元的机器 |
+| `external` | 只观测，不管理 | 别人起的实例 / `install.sh --no-hysteria` |
+
+* `install.sh` 默认 **auto**：`systemctl list-unit-files` 里有 `<HYSTERIA_SERVICE>.service`（默认 `hysteria-server`）就写 `mode: systemd`，否则 `process`；也可显式 `--hysteria-mode=` / `HYSTERIA_MODE=` / `HYSTERIA_SERVICE=`。
+* **为什么必须检测**：agent 再拉起一份 Hysteria 会和 systemd 那份抢 `udp :443`，起来就退出、反复失败回滚（真实现场：`listen udp :443: bind: address already in use`）。
+* 重启语义：systemd 模式直接 `systemctl restart <service>`（先试 `systemctl reload`，单元定义了 `ExecReload` 才有效）；process 模式 SIGTERM 优雅停止后用新配置拉起。
+* 崩溃重启：退避 `1s→60s`（×2，抖动 0.2），窗口 300s 内超过 10 次则放弃并上报 `restart_gave_up`。
+
+## 5. 鉴权：默认 HTTP
+
+静态密码写在节点上，用户离开平台依然能连、也没法按流量/到期回收，所以新生成的配置默认走 **HTTP 鉴权**：
+
+```yaml
+auth:
+  type: http
+  http:
+    url: https://auth.ipx.sarl    # HYSTERIA_AUTH_URL
+    insecure: false               # HYSTERIA_AUTH_INSECURE=1 才跳过证书校验
+```
+
+* 新装就用上面这段；想保留老行为设 `HYSTERIA_AUTH_MODE=password`。
+* **已有节点不会被自动改**（install.sh 默认只读现有 `trafficStats`）；要换必须显式：
+
+```bash
+sudo bash scripts/set-hysteria-auth-http.sh https://auth.ipx.sarl      # 只替换顶层 auth 段，自动备份 + 重启
+# 或 sudo -E bash install.sh https://node.ipx.sarl --set-hysteria-auth --hysteria-auth-url https://auth.ipx.sarl
+```
+
+  两种方式都**只动顶层 `auth` 段**，证书 / `masquerade` / `trafficStats` 一字不改。
+* ⚠️ 切换前先探活鉴权后端，否则**所有用户都会连不上**：
+
+```bash
+curl -si -X POST -H 'Content-Type: application/json' \
+  -d '{"addr":"1.2.3.4:1","auth":"a:b","tx":0,"rx":0}' https://auth.ipx.sarl/auth
+# 期望 200 + {"ok":false,"id":""}
+```
+
+## 6. 安装 / 升级 / 回退 / 卸载
+
+### 6.1 install.sh 参数与环境变量
+
+| 参数 | 说明 |
+|---|---|
+| `<控制面地址>`（位置参数） | 例如 `https://node.ipx.sarl` |
+| `--token=<T>` / `--name=<N>` | 注册令牌 / 节点名 |
+| `--hysteria-mode=<m>` | `auto`(默认) / `systemd` / `process` / `external` |
+| `--hysteria-config=<P>` | Hysteria 配置路径（默认 `/etc/hysteria/config.yaml`） |
+| `--set-hysteria-auth` `--hysteria-auth-url=<U>` `--hysteria-auth-insecure` | 显式把 Hysteria 切成 HTTP 鉴权 |
+| `--no-hysteria` | 不动 Hysteria（`mode` 取 `external`） |
+| `--skip-enroll` | 只装不注册 |
+| `--no-sync-config` / `--strict-sync-config` | 跳过「装完同步配置」/ 同步时严格校验 |
+| `--no-rebuild` / `--use-dist` | 只用现成发布产物，绝不源码重建 |
+| `--verify-only` / `--uninstall` | 只巡检 / 卸载 |
+
+关键环境变量：`HYSTERIA_SERVICE`、`HYSTERIA_MODE`、`SYNC_CONFIG_SOURCE`、`HYSTERIA_DOMAIN`/`HYSTERIA_ACME_EMAIL`、`UPGRADE_PUBKEY`、`AGENT_BINARY`/`AGENT_BINARY_URL`、`SYSTEMD_UNIT_DIR`、`HYSTERIA_AGENT_MACHINE_ID`。
+
+### 6.2 更新节点：装到的必须是新构建
+
+`install.sh` 优先用仓库里入库的 `dist/hysteria-agent-linux-<arch>`，而 **`git pull` 不会更新它** —— 会出现「代码是新的、行为是旧的」（真实现场：装到还没有配置轮询的构建，面板发布的配置永远停在 `published`）。
+
+* 发布产物旁边有 `.commit`（构建来源提交）与 `.sha256`；按 **提交** 判断是否过期（不是 mtime：`git pull` 会把 mtime 全刷成「现在」，每次都误判）；
+* 过期 → 用当前源码重建（`go build`，ldflags 注入真实 commit）；没有 Go 工具链则**明确 WARN**，不静默装旧的；
+* 安装来源优先级：`AGENT_BINARY` > `dist/` > `release/` 包 > `bin/`（本机遗留构建，最后）。真实现场：遗留的 `bin/hysteria-agent` 曾把发布产物顶掉；
+* 装完打印 `hysteria-agent 0.1.0 (<commit>, <time>)`，到节点上对一下就知道装的哪一版。
+
+### 6.3 版本标识与「回到某一版」
+
+* 版本标签 = **最后改动 agent 源码的那个提交**（不是打包提交）：打包/文档提交一行代码没改，却会让源码重建的二进制自报另一个 commit —— 同一份代码两个身份，事后对账全是问号；源码脏了标签带 `-dirty`。
+* 重打发布产物：`make dist` 或 `bash scripts/release-dist.sh`（编译 + `.sha256` + `.commit`）。
+
+```bash
+# 回到某个已发布版本（例如 0.1.0 (61145e9)）
+cd ~/hysteria-agent && git pull
+git log --oneline -5 -- dist/hysteria-agent-linux-amd64        # 找那一版的打包提交
+git checkout <打包提交> -- dist/hysteria-agent-linux-amd64 \
+    dist/hysteria-agent-linux-amd64.sha256 dist/hysteria-agent-linux-amd64.commit
+sudo -E bash install.sh https://node.ipx.sarl --skip-enroll --no-rebuild
+hysteria-agent version                                          # 应显示 (61145e9, …)
+```
+
+### 6.4 自升级（强制验签）
+
+远程 `upgrade_agent` 或手工 `hysteria-agent upgrade --url=… --sha256=… --signature=…`：下载 → 校验 sha256 → 验 ed25519 签名 → 冒烟测试 → 原子替换（保留 `.bak`）→ 重启（`upgrade.restart_mode`）。任一步失败**都不动原二进制**。签名公式见 [附录 B](#附录-b升级签名公式)。
+
+### 6.5 克隆镜像与 machine_id
+
+控制面按 `machine_id` 认节点：**克隆出来的 VPS 镜像 machine-id 相同**，两台会互相顶掉注册。给每台一个固定值：
+
+```yaml
+enroll:
+  machine_id: "jp8-ip2-one"     # 或临时：HYSTERIA_AGENT_MACHINE_ID=xxx hysteria-agent enroll …
+```
+
+## 7. 安全
+
+* 出站 `https`/`wss` + 可选 **SPKI 证书 pinning**（`control.pin_sha256`）；`insecure_skip_verify` 只在有 pin 时允许。
+* 文件权限：配置 0600、凭据 0400（写入时收紧并校验）。
+* 凭据 = `node_id` + `node_secret`（HS256 自签 JWT，`iss=hysteria-agent`、`aud=hysteria-control`）；也可走 mTLS。
+* **远程指令白名单**：`internal/commands` 只认识固定类型，参数按键校验；没有「执行任意 shell」这条路。
+* 自升级必须验签；公钥可在配置里（`upgrade.pubkeys`，支持多把轮换）或编译期注入。
+
+## 8. 可观测
+
+| 端点 | 说明 |
+|---|---|
+| `GET 127.0.0.1:9100/healthz` | 存活 |
+| `GET 127.0.0.1:9100/readyz` | 就绪 = Hysteria 在跑 && 配置已应用 |
+| `GET 127.0.0.1:9100/metrics` | Prometheus |
+
+常用指标：`hysteria_agent_config_apply_total{result}`、`…_config_apply_seconds`、`hysteria_agent_rest_heartbeats_total`、`…_rest_heartbeat_failures_total`、`hysteria_agent_rest_config_polls_total`、`…_rest_config_failures_total`、`hysteria_agent_upgrade_total{result}`、`hysteria_agent_control_reconnects_total`、`hysteria_agent_outbox_pending`，以及 Hysteria 进程/重启计数。
+
+日志：slog JSON，字段 `ts, level, node_id, component, msg, trace_id`（+ 场景字段如 `revision`、`sha256`、`error`、`rolled_back`）。
+
+## 9. 配置参考
+
+`/etc/hysteria-agent/config.yaml`（0600）。最小配置只需要 `control.server_url`。
 
 | 键 | 默认值 | 说明 |
 |---|---|---|
-| `control.server_url` | 必填 | 控制面地址（`https://` 或本地联调的 `http://`） |
-| `control.ws_path` | `/api/v1/agent/control` | 控制通道路径 |
-| `control.enroll_path` | `/api/v1/agent/enroll` | 注册接口路径 |
-| `control.token_path` | `/api/v1/agent/token` | 可选自检接口 |
-| `control.user_agent` | `hysteria-agent` | HTTP User-Agent |
-| `control.ca_file` | 空 | 私有 CA（PEM） |
-| `control.pin_sha256` | `[]` | 证书 SPKI pin（base64），非空则强制 pinning |
-| `control.insecure_skip_verify` | `false` | 仅当有 pin 时才允许为 true |
+| `control.server_url` | 必填 | 控制面地址（`https://`；联调可 `http://` + `allow_insecure_ws`） |
+| `control.ws_path` / `enroll_path` / `token_path` | `/api/v1/agent/control` / `…/enroll` / `…/token` | 通道与注册端点 |
+| `control.rest_heartbeat_path` / `rest_config_path` / `rest_default_config_path` | `/api/v1/agent/heartbeat` / `…/config/latest` / `…/config/default` | REST 兜底面 |
+| `control.config_source` | `default` | `default`（版本文件库默认版本）/ `node`（本节点发布的版本） |
+| `control.config_poll_seconds` / `config_apply_timeout_seconds` | `5` / `180` | 配置轮询间隔 / 单次应用上限 |
+| `control.rest_fallback_seconds` | `300` | 降级窗口，之后重试控制通道 |
+| `control.user_agent` / `ca_file` / `pin_sha256` / `insecure_skip_verify` | `hysteria-agent` / 空 / `[]` / `false` | HTTP 身份与 TLS |
 | `control.allow_insecure_ws` | `false` | 允许 `ws://`（仅本地联调） |
-| `control.connect_timeout_seconds` | `15` | 拨号超时 |
-| `control.handshake_timeout_seconds` | `20` | WebSocket 握手超时 |
+| `control.connect_timeout_seconds` / `handshake_timeout_seconds` | `15` / `20` | 拨号 / 握手超时 |
 | `control.write_timeout_seconds` / `read_timeout_seconds` | `15` / `120` | 读写超时 |
-| `control.heartbeat_interval_seconds` | `30` | 心跳间隔（控制面可在 HelloAck 覆盖） |
-| `control.heartbeat_timeout_seconds` | `90` | 超时判定断线 |
-| `control.telemetry_interval_seconds` | `15` | 遥测间隔（可被覆盖） |
-| `control.jwt_expiry_seconds` | `3600` | 自签 JWT 有效期 |
-| `control.max_message_bytes` | `4194304` | 单帧上限 |
-| `control.token_refresh_leeway_seconds` | `300` | 重连前提前续签的余量 |
-| `control.reconnect.{initial_seconds,max_seconds,multiplier,jitter}` | `1 / 300 / 2 / 0.2` | 退避策略 |
+| `control.heartbeat_interval_seconds` / `heartbeat_timeout_seconds` | `30` / `90` | 心跳与离线判定 |
+| `control.telemetry_interval_seconds` | `15` | 遥测间隔（可被 HelloAck 覆盖） |
+| `control.jwt_expiry_seconds` / `max_message_bytes` / `token_refresh_leeway_seconds` | `3600` / `4194304` / `300` | JWT 与帧上限 |
+| `control.reconnect.{initial_seconds,max_seconds,multiplier,jitter}` | `1 / 300 / 2 / 0.2` | 重连退避 |
 | `credentials_file` | `/etc/hysteria-agent/credentials.json` | 凭据（0400） |
-| `state_dir` | `/var/lib/hysteria-agent` | outbox / state.json / 升级目录 |
-| `runtime_dir` | `/run/hysteria-agent` | 运行时目录 |
-| `hysteria.mode` | `process` | `process` / `systemd` / `external` |
-| `hysteria.binary` | `/usr/local/bin/hysteria` | Hysteria 可执行文件 |
-| `hysteria.config_path` | `/etc/hysteria/config.yaml` | Agent 负责原子写入的目标配置 |
-| `hysteria.service_name` | `hysteria-server` | systemd 模式下的单元名 |
-| `hysteria.work_dir` | 空 | 子进程工作目录 |
-| `hysteria.env` / `hysteria.extra_args` | `[]` | 子进程环境变量/附加参数 |
-| `hysteria.api_base_url` | `http://127.0.0.1:8080` | Hysteria 的 `trafficStats.listen` |
-| `hysteria.api_secret` | 空 | 必须与 `trafficStats.secret` 一致（否则校验会拒绝下发） |
-| `hysteria.log_paths` / `journal_unit` | `[]` / 空 | 附加日志来源 |
-| `hysteria.startup_timeout_seconds` / `shutdown_timeout_seconds` | `20` / `15` | 启动就绪等待 / SIGTERM 优雅停止上限 |
+| `state_dir` / `runtime_dir` | `/var/lib/hysteria-agent` / `/run/hysteria-agent` | outbox / state.json / 升级目录 |
+| `enroll.machine_id` | 空（用本机 `/etc/machine-id`） | 克隆镜像时给每台一个固定值 |
+| `hysteria.mode` | `process`（install.sh 自动检测后常写 `systemd`） | `systemd` / `process` / `external` |
+| `hysteria.binary` / `config_path` / `service_name` | `/usr/local/bin/hysteria` / `/etc/hysteria/config.yaml` / `hysteria-server` | 被管对象 |
+| `hysteria.api_base_url` / `api_secret` | `http://127.0.0.1:8080` / 空 | 必须与 Hysteria 配置里的 `trafficStats.listen` / `.secret` 一致；不一致只是**警告**（仍写入），但 agent 读不到流量、踢不了人 |
+| `hysteria.work_dir` / `env` / `extra_args` | 空 / `[]` / `[]` | 子进程（process 模式） |
+| `hysteria.log_paths` / `journal_unit` | `[]` / `hysteria-server`（`mode: systemd` 时自动启用） | 额外日志来源；建议与单元名一致 |
+| `hysteria.startup_timeout_seconds` / `shutdown_timeout_seconds` | `20` / `15` | 就绪等待 / 优雅停止上限 |
 | `hysteria.restart.{initial,max,multiplier,jitter}` | `1 / 60 / 2 / 0.2` | 崩溃重启退避 |
-| `hysteria.restart_max_in_window` / `restart_window_seconds` | `10` / `300` | 窗口限流，超限放弃重启并上报 |
-| `hysteria.history_dir` / `history_keep` | `/etc/hysteria-agent/history` / `5` | 配置历史与保留数量 |
-| `hysteria.validate_port` / `validate_cert` / `cert_expiry_warn_days` | `true` / `true` / `14` | 下发校验开关与证书告警阈值 |
-| `telemetry.interval_seconds` | `15` | 采集间隔 |
-| `telemetry.disk_paths` | `["/", "/var/lib/hysteria-agent"]` | 磁盘统计路径 |
-| `telemetry.net_interfaces` | `[]`（全部非 lo） | 网络统计接口 |
-| `telemetry.hysteria_enabled` | `true` | 是否读 Hysteria 本地 API |
-| `logs.level` / `format` | `info` / `json` | 日志级别与格式 |
-| `logs.remote_enabled` | `true` | 远程日志采集 |
-| `logs.ring_size` | `2000` | 本地环形缓冲（tail 回放） |
-| `logs.include_hysteria` | `true` | 采集子进程 stdout/stderr |
-| `logs.sample.{max_lines_per_second,burst,min_level,max_batch,flush_interval_ms,max_line_bytes}` | `200/500/info/100/500/8192` | 采样与限速 |
-| `metrics.enabled` / `listen` / `path` | `true` / `127.0.0.1:9100` / `/metrics` | 指标端点 |
-| `metrics.health_path` / `ready_path` | `/healthz` / `/readyz` | 健康端点 |
-| `outbox.path` | `/var/lib/hysteria-agent/outbox.jsonl` | 事件缓冲 |
-| `outbox.max_bytes` / `max_events` / `fsync` / `compact_min_drops` | `32MiB` / `20000` / `true` / `64` | 缓冲上限与落盘策略 |
-| `upgrade.enabled` | `true` | 自升级开关（无公钥时必须 false） |
-| `upgrade.pubkeys` | `[]` | ed25519 公钥（base64），可多把轮换 |
-| `upgrade.binary_path` / `work_dir` | `/usr/local/bin/hysteria-agent` / `/var/lib/hysteria-agent/upgrade` | 目标二进制与工作目录 |
-| `upgrade.allow_downgrade` | `false` | 是否允许降级 |
+| `hysteria.restart_max_in_window` / `restart_window_seconds` | `10` / `300` | 窗口限流，超限放弃并上报 |
+| `hysteria.history_dir` / `history_keep` | `/etc/hysteria-agent/history` / `5` | 配置历史与保留数 |
+| `hysteria.validate_port` / `validate_cert` / `cert_expiry_warn_days` | `true` / `true` / `14` | 下发校验开关与证书告警阈值（结果只作警告） |
+| `telemetry.interval_seconds` / `disk_paths` / `net_interfaces` / `hysteria_enabled` | `15` / `["/", "/var/lib/hysteria-agent"]` / `[]`（全部非 lo） / `true` | 遥测 |
+| `logs.level` / `format` / `remote_enabled` / `ring_size` / `include_hysteria` | `info` / `json` / `true` / `2000` / `true` | 日志 |
+| `logs.sample.{max_lines_per_second,burst,min_level,max_batch,flush_interval_ms,max_line_bytes}` | `200/500/info/100/500/8192` | 远程日志采样与限速 |
+| `metrics.enabled` / `listen` / `path` / `health_path` / `ready_path` | `true` / `127.0.0.1:9100` / `/metrics` / `/healthz` / `/readyz` | 指标端点 |
+| `outbox.path` / `max_bytes` / `max_events` / `fsync` / `compact_min_drops` | `/var/lib/hysteria-agent/outbox.jsonl` / `32MiB` / `20000` / `true` / `64` | 断线缓冲 |
+| `upgrade.enabled` / `pubkeys` | `true` / `[]`（无公钥时必须 false） | 自升级 |
+| `upgrade.binary_path` / `work_dir` / `allow_downgrade` | `/usr/local/bin/hysteria-agent` / `…/upgrade` / `false` | 升级目标 |
 | `upgrade.download_timeout_seconds` / `smoke_test_seconds` | `120` / `10` | 下载与冒烟测试 |
-| `upgrade.restart_mode` / `service_name` | `systemd` / `hysteria-agent` | 升级后的重启方式（`systemd`/`exec`） |
+| `upgrade.restart_mode` / `service_name` | `systemd` / `hysteria-agent` | 升级后重启方式 |
 | `diag.dns_hosts` / `public_ip_urls` | `[]` / `["https://api.ipify.org"]` | 诊断的 DNS 与出口 IP 探测 |
 | `diag.port_check_timeout_ms` / `http_timeout_ms` / `check_control_plane` | `800` / `5000` / `true` | 诊断超时与开关 |
 | `tail_logs.max_duration_seconds` | `300` | `tail_logs` 硬上限（5 分钟） |
 
-## 控制面接口契约（最小实现要点）
+## 10. 排错
+
+先跑 `hysteria-agent diag --json` 与 `journalctl -u hysteria-agent -n 50`，再看下表。
+
+| 现象 | 定位 | 处理 |
+|---|---|---|
+| 面板发配置了，节点磁盘**一动不动** | 看回执里 agent 的话：`无法解析` → 配置坏了；`配置已写入但 Hysteria 未能以新配置就绪` → 起不来（已自动回滚） | ① 改面板正文；② 看回执里的「Hysteria 最后输出」，多半是下面两条 |
+| 回执：`证书/私钥无法加载: open /etc/hysteria/cert.pem: no such file or directory` | 面板正文引用的证书路径在节点上不存在 | 让路径真实存在（`ln -sf <真实证书> /etc/hysteria/cert.pem` + key），或把面板正文改成节点真实路径 |
+| 回执：`listen udp :443: bind: address already in use` | 已有一份 Hysteria 占着端口（多为 systemd 那份），而 agent 又拉起一份 | 切 `hysteria.mode: systemd`（`install.sh --hysteria-mode=systemd`），让 agent 用 `systemctl restart hysteria-server` 管那一份；`ss -lntup \| grep ':443'` 确认持有者 |
+| 版本号疯涨 / 面板一堆同内容版本 | 「失败 → 自动回滚 → 再失败」循环（环境问题） | 已内建三道护栏（见 [3.3](#33-校验只作警告--自动回滚)），审计里 `config.auto_rollback_skipped`；根因通常是上面两条 |
+| 面板「配置版本」显示 `未识别` | 节点上报的 sha256 与控制面任何版本都对不上（被面板之外改过） | 让节点按面板同步一次（`config sync`），或在面板里为这份内容建一版 |
+| `config sync` 说「已是最新」但磁盘里是旧值 | 它比的是内容 sha，旧值与面板当前那版**逐字节相同** | 面板改内容（或换默认版本）→ sha 变化 → 下次同步写入 |
+| 面板列出的版本号与节点自报的不一样 | 列表按 `config_sha256` 反查，不信任自报版本号（自报可能因回滚/手工改而失真） | 以列表为准；悬停里写明「按版本管理 / 本节点历史 / 节点自报认定」 |
+| `TLS 预检失败: … missing port in address` | 地址没写端口 | 写全 `https://host:443` |
+| `注册失败(404)：<!DOCTYPE html>…` | 打到网页而不是 API：路径不对，或控制面没实现 Agent 接口 | `hysteria-agent enroll --check` 打印实际 URL/状态码/结论；确认对端有 `POST /api/v1/agent/enroll` |
+| `注册失败(401)：未知的 enroll_token` | 令牌写错 / 一次性已用 / 过期 / 被吊销 | 面板重新签发 |
+| `enroll --check` 里 TLS 通过但 WS 连不上 | 反代没转发 WebSocket | nginx 加 `Upgrade`/`Connection` + `proxy_read_timeout 3600s`；cloudflared 用带 path 的 ingress（见 [附录 C](#附录-c自带控制面--桥接--反代)） |
+| 启动即退出：`control.server_url 使用明文` | 用了 `http://` | 生产用 `https://`；联调加 `control.allow_insecure_ws: true` |
+| 启动即退出：`没有可用验签公钥` | `upgrade.enabled: true` 但没配公钥 | `upgrade.enabled: false` 或填 `upgrade.pubkeys` |
+| WS 握手 401 / `JWT 校验失败` | 控制面 `node_secret` 不一致，或时钟偏差大 | 对比 `credentials.json`、看 `diag` 时钟项、同步 NTP；控制面换 `master_key` 会让所有节点必须重新注册 |
+| 断开后一直重连（`control_reconnects_total` 涨） | 网络/隧道/控制面不可用 | 看 `diag` 的 `control_plane` 项，确认 `X-Node-ID` 与 JWT 一致 |
+| 「最后心跳」不动 | 控制通道不可用但 REST 兜底没生效 | 确认 `control.rest_heartbeat_path` 可用；看 `rest_heartbeat_failures_total` |
+| `tail_logs` 收不到 Hysteria 日志 | `systemd`/`external` 模式需要 `hysteria.journal_unit` | 填单元名；`process` 模式 agent 直接抓子进程 stdout |
+| 指标端点起不来 | 9100 被占 | 改 `metrics.listen`（默认只监听 127.0.0.1） |
+| 日志说「目标配置不存在」但文件确实在 | systemd 单元带 `PrivateTmp=true`，服务看不到宿主机 `/tmp` | 配置放 `/etc`、`/var/lib` 等真实路径，别放 `/tmp` |
+| 升级后版本没变 | 单元名不匹配 / 没权限重启 | 对齐 `upgrade.service_name`；看 `/metrics` 的 `upgrade_total{result}` |
+| 两台节点互相顶掉注册 | 克隆镜像 `machine-id` 相同 | 见 [6.5](#65-克隆镜像与-machine_id) |
+| `restart_gave_up`：Hysteria 反复崩溃 | Hysteria 自身报错（配置/证书/端口） | 看 `config.last_apply_error` 与 journal；修好后 `hysteria-agent restart` |
+
+## 11. 测试与验证
+
+```bash
+make build                      # bin/hysteria-agent + bin/controlplane
+make test                       # go test ./...（各内部包单测）
+make vet                        # go vet
+bash tests/e2e.sh               # 真实 agent + 假控制面 + 假 Hysteria，端到端 75 项
+make smoke-release              # 用发布包里的二进制重跑一遍全流程（验完发布产物再发版）
+make smoke-cp                   # 跑自带的 cmd/controlplane 全流程
+```
+
+需要真实控制面/面板的端到端（本机跑）：
+
+```bash
+PANEL_URL=http://127.0.0.1:8001 bash tests/rest_config_e2e.sh    # 19 项：按节点发布 → 生效 → applied / 坏配置回滚
+PANEL_URL=http://127.0.0.1:8001 bash tests/rest_fallback_e2e.sh  #  9 项：REST 兜底心跳持续前移
+PANEL_URL=http://127.0.0.1:8001 bash tests/install_sync_e2e.sh   # 16 项：跑真 install.sh，装完/再跑都跟上面板
+PANEL_URL=http://127.0.0.1:8001 bash tests/bridge_e2e.sh         # 14 项：Go 控制面桥接 Laravel（身份权威在面板）
+```
+
+不需要外部依赖的回归（本轮全部实测通过）：
+
+| 测试 | 断言数 | 覆盖 |
+|---|---|---|
+| `tests/e2e.sh` | 75 | 注册 / 长连接 / 配置下发 / **无法解析才拒收、可解析仍写入** / 自动回滚 / 进程守护 / 远程指令 / 断线补发 / 自升级 / 优雅停止 |
+| `tests/auto_converge_e2e.sh` | 18 | 本机与面板默认版本不一致 → 自动更新 + **重启 Hysteria**；面板改默认版本 → 再跟一轮；内容与节点现状不符（secret 不一致）仍写入 |
+| `tests/config_sync_test.sh` | 33 | `config sync` 全部分支（来源、dry-run、strict、幂等、被手工改过、历史快照） |
+| `tests/install_version_identity_test.sh` | 21 | 版本标识取源码提交 / 发布产物 `.commit` / 来源优先级（`dist/` > `bin/`）/ `--no-rebuild` / `hysteria.mode` 自动检测 |
+| `tests/install_binary_freshness_test.sh` | 10 | 发布产物过期判定（提交比对 + mtime 兜底）与源码重建 |
+| `tests/install_sync_e2e.sh` | 16 | 跑真 install.sh：装完跟上 / 已是最新不重写 / `--no-sync-config` 跳过 |
+| `tests/hysteria_auth_http_test.sh` | 37 | HTTP 鉴权生成逻辑 + 「两份实现输出一致」防漂移断言 |
+| `go test ./...` + `go vet` | — | `outbox`/`hyconfig`/`upgrade`/`creds`/`wire`/`control`/`supervisor`/`cp` 等包单测 |
+
+真机安装（`tests/install_test.sh`）：在装有生产 Hysteria 的机器上用独立单元名 + 生产配置的**副本**跑 install.sh，安装 → enroll → `/healthz`、`/readyz` 200 → `trafficStats` API 200（无 secret 负例 401）→ `--verify-only` 退出码 0 → `--uninstall` 清理；并用 `md5sum` 与 `MainPID` 证明生产的配置与 `hysteria-server` 未被改动、未被重启。
+
+## 12. 目录结构与开发
 
 ```
-POST /api/v1/agent/enroll    → {node_id, node_secret, pin_sha256?, ...}
-GET  /api/v1/agent/control   → WebSocket（Authorization: Bearer <JWT(HS256, key=node_secret)>）
+.
+├── cmd/
+│   ├── hysteria-agent/       # 主程序（enroll/run/status/diag/restart/upgrade/config/version）
+│   ├── controlplane/         # 自带控制面：注册/控制通道/配置下发/指令/事件归档 + CLI + 只读仪表盘
+│   ├── agent-sign/           # 升级签名工具（keygen/sign/pubkey）
+│   ├── mockcontrol/          # 假控制面（协议第二实现 + REST 兜底面 + E2E 驱动接口）
+│   └── mockhysteria/         # 假 Hysteria2（端口 + /traffic /online /kick + 毒配置）
+├── internal/
+│   ├── agent/       # 装配层与配置应用管线（校验→快照→原子写→重启→回滚）
+│   ├── commands/    # 远程指令白名单分发（含 tail_logs 流式）
+│   ├── config/      # agent 自身配置（默认值/校验/路径常量）
+│   ├── control/     # 控制通道（握手/心跳/重连/补发）+ REST 兜底（心跳/配置/回执）
+│   ├── creds/       # 凭据 0400、JWT 自签、SPKI pinning
+│   ├── diag/        # 12 项健康检查
+│   ├── enroll/      # 一次性注册（含 machine_id 覆盖）
+│   ├── hyapi/       # Hysteria 本地 API（/traffic /online /kick）
+│   ├── hyconfig/    # 配置校验 + 历史/原子写/回滚 + DiskIdentity（实盘身份）
+│   ├── logging/ logs/ metrics/ outbox/ telemetry/
+│   ├── supervisor/  # Hysteria 守护（process/systemd/external + 重启策略）
+│   ├── sysinfo/     # /proc 采集与端口/PID 归因
+│   ├── upgrade/     # 验签 + 冒烟 + 原子替换 + 重启
+│   ├── version/     # 构建期注入的版本与升级公钥
+│   └── wire/        # 信封编解码与枚举命名
+├── proto/agent.proto        # 控制通道协议（唯一权威定义）
+├── gen/agentpb/             # protoc 生成代码
+├── deploy/                  # systemd 单元 + 配置模板
+├── scripts/                 # release-dist.sh（重打发布产物）、set-hysteria-auth-http.sh
+├── tests/                   # e2e 与各专项回归
+├── install.sh  Makefile
+└── DESIGN.md  docs/BRIDGE-TO-CONTROL-PLANE.md
 ```
 
-* JWT claims：`iss=hysteria-agent`、`sub=<node_id>`、`aud=hysteria-control`、`exp/iat/nbf/jti`；用该节点的 `node_secret` 做 HS256 验签即可。
-* 收到 `Hello` 要回 `HelloAck{resend_from_seq: 已确认最大 seq+1, heartbeat_interval_seconds, telemetry_interval_seconds}`。
-* 所有 `seq>0` 的消息都要按 `(node_id, seq)` **幂等入库**，并回 `EventAck{acked_seq}`（累积确认）。
-* 帧格式：WebSocket 二进制帧 = `Envelope` 的 protobuf 序列化（`proto/agent.proto`）。
+```bash
+make            # = make build：bin/hysteria-agent + bin/controlplane（+ 工具）
+make tools      # mockcontrol / mockhysteria / agent-sign / cpapi-smoke
+make proto      # 重新生成 protobuf（需 protoc + protoc-gen-go）
+make test       # go test ./...
+make vet        # go vet ./...
+make dist       # 重打发布产物 dist/*（含 .sha256 与 .commit）
+make release    # 打 tarball + SHA256SUMS
+make smoke-release / smoke-cp / clean
+```
+
+协议改动流程：改 `proto/agent.proto` → `make proto` → 改 `internal/wire` → 同步 `cmd/mockcontrol`（第二实现）→ 更新 `DESIGN.md` 消息表 → `make e2e`。
+
+## 附录 A：控制面最小契约
+
+```
+POST /api/v1/agent/enroll   → {node_id, node_secret, pin_sha256?, heartbeat_interval_seconds, …}
+GET  /api/v1/agent/control  → WebSocket（Authorization: Bearer <自签 JWT> 或 ?key=node_secret）
+
+# 控制通道不可用（404/405/501，例如 PHP 控制面）时走 REST 兜底：
+POST /api/v1/agent/heartbeat                                          ← 心跳（含 config_version/config_sha256/config_path 现状）
+GET  /api/v1/agent/config/default?current_version=N&current_sha256=X   ← 默认版本文件（与节点无关）
+GET  /api/v1/agent/config/latest?current_version=N&current_sha256=X    ← 本节点发布的版本
+POST /api/v1/agent/config/ack                                         ← {version, status: applied|failed, error}
+```
+
+* JWT claims：`iss=hysteria-agent`、`sub=<node_id>`、`aud=hysteria-control`、`exp/iat/nbf/jti`；用该节点 `node_secret` 做 HS256 验签。
+* `Hello` → 回 `HelloAck{resend_from_seq: 已确认最大 seq+1, heartbeat_interval_seconds, telemetry_interval_seconds}`。
+* 所有 `seq>0` 的消息按 `(node_id, seq)` **幂等入库**，回 `EventAck{acked_seq}`（累积确认）。
+* 帧格式：WebSocket 二进制帧 = `Envelope` 的 protobuf（`proto/agent.proto`）。
+* 取配置端点对「空数据」必须给安全默认（`up_to_date: true` + `config: null`）：老节点拿到只会照常跳过，不会乱动本地文件；同时**库里没有默认版本时要能退回单节点版本**，否则「面板发布了配置但节点一无所获」。
 
 FastAPI 骨架（节选）：
 
 ```python
-from fastapi import FastAPI, WebSocket, Header
-import jwt  # PyJWT
-
 @app.post("/api/v1/agent/enroll")
 def enroll(body: dict, x_enroll_token: str = Header(default="")):
-    token = x_enroll_token or body["enroll_token"]
-    node = cp.consume_enroll_token(token)          # 一次性令牌
-    return {"node_id": node.id, "node_secret": node.secret,
-            "pin_sha256": [cp.spki_pin], "heartbeat_interval_seconds": 30,
-            "telemetry_interval_seconds": 15}
+    node = cp.consume_enroll_token(x_enroll_token or body["enroll_token"])   # 一次性令牌
+    return {"node_id": node.id, "node_secret": node.secret, "pin_sha256": [cp.spki_pin],
+            "heartbeat_interval_seconds": 30, "telemetry_interval_seconds": 15}
 
 @app.websocket("/api/v1/agent/control")
-async def control(ws: WebSocket, authorization: str = Header(default=""),
-                  x_node_id: str = Header(default="")):
+async def control(ws: WebSocket, authorization: str = Header(default=""), x_node_id: str = Header(default="")):
     node = cp.get_node(x_node_id)
-    jwt.decode(authorization.removeprefix("Bearer "), node.secret, algorithms=["HS256"],
-               audience="hysteria-control", issuer="hysteria-agent")   # 校验
+    jwt.decode(authorization.removeprefix("Bearer "), node.secret,
+               algorithms=["HS256"], audience="hysteria-control", issuer="hysteria-agent")
     await ws.accept()
     async for raw in ws.iter_bytes():
-        env = Envelope.FromString(raw)             # agent_pb2
-        cp.handle(node, env)                       # 幂等入库 + ack
+        cp.handle(node, Envelope.FromString(raw))     # 幂等入库 + ack
 ```
 
-更多参考实现与端到端测试：`cmd/mockcontrol`（控制面）、`cmd/mockhysteria`（假 Hysteria）、`cmd/agent-sign`（升级签名工具）、`tests/e2e.sh`。
+参考实现：`cmd/mockcontrol`（假控制面，200 行级，含 REST 兜底面与测试驱动接口）、`cmd/controlplane`（完整实现）、`cmd/mockhysteria`（假 Hysteria）。
 
-## 升级签名公式
+## 附录 B：升级签名公式
 
 ```
 sha256_hex = hex(sha256(binary))
@@ -508,129 +505,59 @@ signature  = base64(ed25519_sign(private_key, sha256_hex))     # 对哈希的 he
 ```
 
 ```bash
-./bin/agent-sign keygen -out /etc/hysteria-agent/upgrade.key     # 打印 base64 公钥
-# 公钥填进 Agent 的 upgrade.pubkeys（或用 -ldflags 注入 version.UpgradePublicKey）
+./bin/agent-sign keygen -out /etc/hysteria-agent/upgrade.key     # 打印 base64 公钥 → upgrade.pubkeys
 ./bin/agent-sign sign -key /etc/hysteria-agent/upgrade.key -file ./hysteria-agent \
   -version 0.2.0 -url https://cp.example.com/dl/hysteria-agent-0.2.0
 # 输出的 JSON 直接作为 upgrade_agent 指令的 params
 ```
 
-## 工作方式与可靠性
+## 附录 C：自带控制面 / 桥接 / 反代
 
-* **投递语义 at-least-once**：`seq>0` 的消息先写 outbox（fsync）再发送，控制面累积确认后才删除；断线重连从 `resume_from_seq` 补发。控制面必须按 `(node_id, seq)` 幂等入库。
-* **配置热更新是"优雅重启"**：Hysteria 2 上游只处理 `SIGINT/SIGTERM`（没有 SIGHUP 处理），所以 Agent 的做法是 SIGTERM 优雅收尾 → 以新配置拉起，断连窗口通常是进程启动时间，客户端会自动重连。这一点在 [DESIGN.md §4.2](DESIGN.md) 有明确说明，不做"看起来支持热重载"的封装。
-* **自动回滚**：新配置校验通过但服务起不来（端口冲突、证书问题、上游拒绝启动）→ 自动恢复上一个版本并重启，回执里 `rolled_back=true`，同时上报 `config_rolled_back` 事件。
-* **`/readyz` 的语义**：`Hysteria 在跑 && 配置已应用`。控制通道断开**不会**让它变 not ready——已连接的用户仍在正常使用，控制面侧看 `Heartbeat` 超时即可判定节点离线。
-* **踢人 ≠ 封禁**：`kick_users` 只调 Hysteria `/kick`，客户端会自动重连。真正阻断必须在控制面认证后端把用户置为禁用。
-
-## 验证记录
-
-代码量：Go 源码 ~11.2k 行（不含 protoc 生成）+ 协议 330 行 + 脚本/文档 ~2k 行。
-
-### 单元测试（`make test`，5 个包 36 个函数 / 41 个用例，全绿）
-
-| 包 | 覆盖内容 |
-|---|---|
-| `outbox` (6) | 递增 seq、累积确认、重启恢复、上限丢弃、坏行容错、**水位线高于条目时不搁置事件**（回归） |
-| `hyconfig` (13) | 五层校验各失败分支（缺 listen/非法 auth/acme 无域名/secret 不一致/证书过期/证书私钥不匹配/临期告警/端口被占 vs 被自己占）、JSON 格式、垃圾输入；历史快照、原子写 0600、回滚、Prune 保留 3 个、索引损坏自愈、rejected 版本不参与回滚 |
-| `upgrade` (6) | 合法签名、篡改内容、错误密钥、缺签名、原子替换 + 备份 + 0755、下载失败/验签失败/冒烟失败时**不动原二进制** |
-| `creds` (7) | 凭据 0400 写入与加载收紧、JWT 往返/坏密钥/篡改/过期、SPKI pin 匹配与不匹配、insecure 无 pin 报错 |
-| `wire` (3) | 15 种信封往返、协议版本不兼容拒绝、白名单解析与未知指令拒绝 |
-
-### 端到端（`make e2e`：真实 Agent + 假控制面 + 假 Hysteria，断言"控制面收到了什么"）
-
-73 项断言，覆盖需求逐条：
-
-| 场景 | 断言要点 |
-|---|---|
-| 注册 | enroll 成功；`credentials.json` 0400；错误令牌被拒 |
-| 长连接 | Hello 带能力白名单与 `resume_from_seq`；心跳与指标到达；`/healthz`、`/readyz`、`/metrics` 均 200 |
-| 配置下发 | 目标文件 0600 且内容为新版；`ConfigAck{ok:true}`；revision 写入历史与 state.json；Hysteria 以新配置运行 |
-| 非法配置 | 回执 `ok=false` 且**磁盘文件 sha256 未变**；上报 `config_failed` 事件 |
-| 起不来的配置 | 自动回滚（`rolledBack:true`）、Hysteria 重新运行、revision 回退、上报 `config_rolled_back` |
-| 进程守护 | `kill -9` 后新 pid 拉起且与 state.json 一致；`restart_count` 增长；上报 `exited` 事件且 `exitCode=137` |
-| 远程指令 | get_state / run_diagnostic（报告含端口、证书、DNS 检查项并落盘）/ kick_users（真实调到 Hysteria `/kick` 且回执含用户）/ tail_logs（分片 + `eof` + 内容含日志行）/ reload_config 全部有断言；**重复 command_id 只执行一次** |
-| 断线补发 | 断线期间 `pending_events>0`、state 显示断开；重连后从 `resume_from_seq` 起 seq **连续、无缺口、无重复**，断线期间的事件确实补发 |
-| 自升级 | 错误签名被拒且二进制不变；正确签名 → 版本变 9.9.9、保留 .bak 备份、exec 重启后 Agent 仍在线、控制通道重连、Hysteria 重新拉起 |
-| 优雅停止 | SIGTERM 后先停 Hysteria 再退出（`hysteria-agent 已退出`），子进程不残留 |
-
-复现：`make e2e`（本机实测 PASS=73 FAIL=0）。
-
-### 真机安装（`tests/install_test.sh`）
-
-在装有生产 Hysteria 的机器上，用独立单元名 + 生产配置的**副本**跑 `install.sh`：安装 → enroll → 服务 active → `/healthz`、`/readyz` 200 → 隔离实例的 `trafficStats` API 200（不带 secret 的负例 401）→ `--verify-only` 退出码 0 → `--uninstall` 清理干净；并用 `md5sum` 与 `MainPID` 证明生产的 `/etc/hysteria/config.yaml` 与 `hysteria-server` 既未被改动也未被重启（结果见提交说明）。
-
-## 排错表
-
-| 现象 | 定位 | 处理 |
-|---|---|---|
-| `TLS 预检失败: dial tcp: address cp.example.com: missing port in address` | 老版本没有给无端口的 URL 补默认端口（已修） | 升级到当前版本；或把地址写成 `https://cp.example.com:443` |
-| `注册失败(404)：<!DOCTYPE html>…` | 打到了网页而不是 API：路径不对，或控制面还没实现 Agent 接口（Laravel/Rails 的默认 404 页正是这种） | 先自检：`hysteria-agent enroll --check`（会打印实际 URL、HTTP 状态、Content-Type 和结论）；确认对端有 `POST /api/v1/agent/enroll`；用本仓库的 `install-controlplane.sh` 起控制面并按 README「控制面」一节配路径路由 |
-| `注册失败(401)：未知的 enroll_token` | 令牌写错 / 已用过（一次性）/ 已过期 / 被吊销 | `controlplane token list` 看用量，重新 `token new` |
-| `enroll --check` 里 TLS 通过但 WS 连不上 | 反代没有转发 WebSocket | nginx 加 `Upgrade`/`Connection` + `proxy_read_timeout 3600s`；cloudflared 用带 path 的 ingress 规则 |
-| 启动即退出：`control.server_url 使用明文` | 用了 `http://` | 生产用 `https://`；联调加 `control.allow_insecure_ws: true` |
-| 启动即退出：`没有可用验签公钥` | `upgrade.enabled: true` 但没配公钥 | `upgrade.enabled: false` 或填 `upgrade.pubkeys` |
-| `JWT 校验失败` / WS 握手 401 | 控制面侧 `node_secret` 与本地不一致，或时钟偏差过大 | 对比 `credentials.json`、查 `diag` 的时钟检查、同步 NTP；控制面换了 `master_key` 会导致所有节点必须重新注册 |
-| 控制面 `/admin/nodes` 返回 401 | 令牌不对 | 用配置文件里的 `admin_token`，或 `--token` 指定 |
-| 心跳迟迟不到（`uptime=0`） | 老版本里 HelloAck 协商的心跳间隔要等下一次重连才生效（已修） | 升级 Agent |
-| `证书 pinning 校验失败：…SPKI pin = …` | 控制面证书换了或 pin 配错 | 用报错里的实际 pin 更新 `control.pin_sha256` 或注册响应 |
-| 连接一直重连（`control_reconnects_total` 涨） | 网络/隧道/控制面不可用 | 看 `diag` 的 `control_plane` 检查，确认 `X-Node-ID` 与 JWT 一致 |
-| 配置下发被拒：`trafficStats.secret 与 Agent 的 hysteria.api_secret 不一致` | Hysteria 配置里的 secret 与 Agent 配置不一致 | 改一处即可（改 Hysteria 配置要重启 Hysteria） |
-| 配置下发被拒：`udp/443 已被进程 … 占用` | 端口被别人抢了 | `ss -ulnp \| grep 443` 查持有者；若就是自己的 hysteria，检查 `hysteria.api_base_url`/进程归属 |
-| 回滚循环（`rolled_back` 反复出现） | 下发的新配置本身起不来 | 看 `config.last_apply_error` 与 journalctl 里 hysteria 的报错；修正后重发 |
-| `hysteria 反复崩溃`、`restart_gave_up` | 日志里 hysteria 的报错 | 修配置/证书；修好后 `hysteria-agent restart` |
-| 升级后旧版本仍在跑 | `restart_mode: systemd` 但单元名不对 | 对齐 `upgrade.service_name`；或看 `/metrics` 的 `upgrade_total{result}` |
-| `tail_logs` 收不到 hysteria 日志 | `systemd`/`external` 模式下需要 `hysteria.journal_unit` | 填单元名；`process` 模式下 Agent 直接抓子进程 stdout |
-| 指标端点起不来 | 9100 被占 | 改 `metrics.listen`（默认只监听 127.0.0.1） |
-| Agent 日志说"目标配置不存在"但文件确实在 | systemd 单元带 `PrivateTmp=true`，服务进程看不到宿主机的 `/tmp` | 配置必须放在 `/etc`、`/var/lib` 等真实路径，不要放 `/tmp` |
-| 升级后 Hysteria 起不来、日志报端口被占 | exec 模式重启留下的孤儿子进程还占着 443 | 本版本已在重启前先停被守护进程；若仍出现，`ss -ulnp` 找孤儿并 kill |
-
-## 目录结构
-
-```
-.
-├── cmd/
-│   ├── hysteria-agent/     # 主程序（CLI：enroll/run/status/restart/upgrade/diag/config/version）
-│   ├── controlplane/       # 控制面：注册/控制通道/配置下发/指令下发/事件归档 + CLI + 只读仪表盘
-│   ├── agent-sign/         # 控制面侧升级签名工具（keygen/sign/pubkey）
-│   ├── mockcontrol/        # 假控制面（协议第二实现 + E2E 驱动接口）
-│   └── mockhysteria/       # 假 Hysteria2（监听端口 + /traffic /online /kick + 毒配置）
-├── internal/
-│   ├── agent/       # 装配层：子系统编排、配置应用管线（校验→落盘→热更新→回滚）
-│   ├── commands/    # 远程指令白名单分发与执行（含 tail_logs 流式）
-│   ├── config/      # Agent 自身配置（默认值 + 校验 + 路径常量）
-│   ├── control/     # WebSocket 控制通道（握手、心跳、重连、补发、分发）
-│   ├── creds/       # 凭据 0400、JWT 自签、mTLS、SPKI pinning
-│   ├── diag/        # 12 项健康检查
-│   ├── enroll/      # 一次性注册
-│   ├── hyapi/       # Hysteria 本地 API 客户端（/traffic /online /kick）
-│   ├── hyconfig/    # Hysteria 配置校验（五层）+ 版本历史 + 原子写 + 回滚
-│   ├── logging/     # slog JSON + 环形缓冲 + 采样器 + trace_id
-│   ├── logs/        # 远程日志批量投递
-│   ├── metrics/     # Prometheus 指标 + /healthz /readyz
-│   ├── outbox/      # 断线事件缓冲（JSONL + 确认水位线）
-│   ├── supervisor/  # Hysteria 进程/服务守护（process/systemd/external）
-│   ├── sysinfo/     # /proc 采集 + 端口/PID 归因（不引第三方库）
-│   ├── telemetry/   # 指标采集与投递
-│   ├── upgrade/     # 验签 + 冒烟测试 + 原子替换 + 重启
-│   ├── version/     # 构建期注入的版本与升级公钥
-│   └── wire/        # 信封编解码与枚举命名
-├── proto/agent.proto        # 控制通道协议（唯一权威定义）
-├── gen/agentpb/             # protoc 生成代码
-├── deploy/                  # systemd 单元 + 配置模板
-├── tests/e2e.sh, dumpq.py   # 端到端联调与断言工具
-├── install.sh               # 一键安装
-└── Makefile
-```
-
-## 开发
+**内置控制面**（`cmd/controlplane`，开箱可用）：
 
 ```bash
-make proto     # 重新生成 protobuf（需要 protoc + protoc-gen-go）
-make test      # 单元测试
-make e2e       # 端到端联调（需要 openssl、python3、root）
-make tools     # 构建 mockcontrol / mockhysteria / agent-sign
-make dist      # 产出带 sha256 的发布产物
+bash install-controlplane.sh --public-url https://cp.example.com   # 装二进制 + 0600 配置（随机 admin_token 与主密钥）+ systemd + 现场验证
+controlplane token new --name hk-node-1        # 一次性注册令牌
+controlplane nodes | node <id> | events <id> --limit 50
+controlplane push-config <id> /etc/hysteria/config.yaml --reason "调 masquerade" --wait 25s
+controlplane command <id> run_diagnostic
+controlplane delete-node <id>                  # 吊销：node_secret 由 master_key 派生，删记录即失效
 ```
 
-协议改动流程：改 `proto/agent.proto` → `make proto` → 改 `internal/wire` → 同步 `cmd/mockcontrol`（第二实现）→ `DESIGN.md` 的消息表 → 跑 `make e2e`。
+设计要点：`node_secret = HMAC-SHA256(master_key, "node_secret:"+node_id)`（控制面不存密钥）；按 `(node_id, seq)` 幂等入库；配置下发 `ConfigPush → ConfigAck` 按 revision 幂等重发；状态在 `state_dir/state.json`(0600) 与 `events/<node>.jsonl`(0600)。管理侧接口：`GET /admin/nodes`、`…/{id}`、`POST …/{id}/config`、`POST …/{id}/commands?type=…`、`GET …/{id}/events|telemetry`、`POST /admin/tokens`、`DELETE …`；浏览器 `/` 是只读仪表盘。
+
+**桥接模式**（Go 控制面只终结通道，身份/数据全落 Laravel 面板，见 [docs/BRIDGE-TO-CONTROL-PLANE.md](docs/BRIDGE-TO-CONTROL-PLANE.md)）：
+
+```yaml
+# /etc/hysteria-controlplane/config.yaml
+identity: { authority: "laravel" }
+laravel:  { base_url: "https://cp.example.com", enroll_path: "/api/v1/agent/enroll" }
+poll:     { config_seconds: 2, commands_seconds: 10, fallback_only: true }
+reverb:   { enabled: true, key: "<REVERB_APP_KEY>", host: "cp.example.com", port: 443, scheme: "https" }
+```
+
+注册被原样代理到 Laravel（同一个 `node_id` 立刻出现在面板里）；心跳/遥测/日志/诊断由控制面**转发**到 Laravel（per-node 后台队列，agent 侧永不阻塞）。自检：`go run ./cmd/cpapi-smoke -cp https://cp.example.com -email <admin> -password <pw>`。
+
+**反代**（控制通道是长连接，必须转发 `Upgrade`/`Connection`）：
+
+```yaml
+# ~/.cloudflared/config.yml
+ingress:
+  - hostname: node.ipx.sarl
+    path: /api/v1/agent/.*
+    service: http://127.0.0.1:8443      # 控制面（WS 同路径，cloudflared 自动转发 Upgrade）
+  - hostname: node.ipx.sarl
+    service: http://127.0.0.1:8080      # 原有面板/站点
+  - service: http_status:404
+```
+
+```nginx
+location ~ ^/api/v1/agent/ {
+    proxy_pass http://127.0.0.1:8443;
+    proxy_http_version 1.1;
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection "upgrade";
+    proxy_read_timeout 3600s;
+    proxy_set_header X-Node-ID $http_x_node_id;
+}
+```
