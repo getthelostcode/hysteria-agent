@@ -59,7 +59,24 @@ func main() {
 	}
 }
 
+// startMarker 把每次启动追加进 MOCK_HYSTERIA_START_LOG（测试靠它证明「配置变了以后真重启了」）。
+// 只有设了这个环境变量才写，正常测试/线上都不受影响。
+func startMarker(cfgPath string) {
+	path := os.Getenv("MOCK_HYSTERIA_START_LOG")
+	if path == "" {
+		return
+	}
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	fmt.Fprintf(f, "%d %s %s\n", os.Getpid(), time.Now().UTC().Format(time.RFC3339Nano), cfgPath)
+}
+
 func runServer(args []string) {
+	startMarker(strings.Join(args, " "))
+
 	var cfgPath, apiListen, secret, kickFile string
 	for i := 0; i < len(args); i++ {
 		switch args[i] {

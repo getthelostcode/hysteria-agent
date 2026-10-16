@@ -99,7 +99,26 @@ hysteria-agent config sync --reload      # 落盘后顺带重启被守护的 Hys
 
 回归：`bash tests/install_binary_freshness_test.sh`（10 项断言，含「用 go shim 验证确实走了源码重建」）。
 
-### 克隆镜像与 machine_id
+### 自动跟上面板的「默认版本」（改完默认版本，节点自己更新并重启 Hysteria）
+
+守护进程默认就按「配置版本文件库的默认版本」收敛（`control.config_source` 留空 = `default`）：
+
+1. 每 `control.config_poll_seconds`（默认 5s）拉一次 `/api/v1/agent/config/default`，带上本机文件的
+   `current_version` 与 `current_sha256`；
+2. 控制面按 **sha256** 判断「是不是同一份内容」—— 不一致就下发正文（库里没有默认版本时自动退回
+   「本节点发布的版本」，不会一无所获）；
+3. 节点侧：校验 → 留历史快照 → 原子写 0600 → **重启被守护的 Hysteria**（process 模式 SIGTERM 优雅停止后
+   用新配置拉起；systemd 模式先 `systemctl reload`，不可用则 restart）→ 回执 `applied` 给面板；
+   起不来则自动回滚并如实上报原因。
+
+于是运维只需要在面板「配置管理 → 版本管理」里改一次默认版本（下拉 + 保存），各节点就会自己更新并重启。
+不想让它跟文件库走，就写 `config_source: node`（按本节点发布的第几版）或 `config_source: ""`…… 注意
+守护进程默认就是 `default`，要恢复旧行为请显式写 `config_source: node`。
+
+端到端验证：`bash tests/auto_converge_e2e.sh`（真 agent + mock 控制面 + mock Hysteria，断言两轮收敛
+「本机不一致 → 自动更新为默认版本 → 重启 Hysteria」，以及面板改默认版本后再跟一轮）。
+
+## 克隆镜像与 machine_id
 
 控制面按 `machine_id` 认节点：**克隆出来的 VPS 镜像 machine-id 相同**，两台会互相顶掉注册
 （面板里只留得下一台）。给每台机器一个固定值即可：

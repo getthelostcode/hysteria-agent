@@ -232,12 +232,15 @@ const (
 func Default() *Config {
 	return &Config{
 		Control: Control{
-			WSPath:                    "/api/v1/agent/control",
-			EnrollPath:                "/api/v1/agent/enroll",
-			TokenPath:                 "/api/v1/agent/token",
-			RESTHeartbeatPath:         "/api/v1/agent/heartbeat",
-			RESTConfigPath:            "/api/v1/agent/config/latest",
-			RESTDefaultConfigPath:     "/api/v1/agent/config/default",
+			WSPath:                "/api/v1/agent/control",
+			EnrollPath:            "/api/v1/agent/enroll",
+			TokenPath:             "/api/v1/agent/token",
+			RESTHeartbeatPath:     "/api/v1/agent/heartbeat",
+			RESTConfigPath:        "/api/v1/agent/config/latest",
+			RESTDefaultConfigPath: "/api/v1/agent/config/default",
+			// 守护进程默认按「配置版本文件库的默认版本」收敛：面板那边改了默认版本，
+			// 节点下一次轮询就会自动更新并重启 Hysteria（库里没有默认版本时自动退回本节点发布的版本）。
+			ConfigSource:              "default",
 			UserAgent:                 "hysteria-agent",
 			ConnectTimeoutSeconds:     15,
 			HandshakeTimeoutSeconds:   20,

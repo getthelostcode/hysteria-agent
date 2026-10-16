@@ -15,14 +15,24 @@
 //	POST /_test/upgrade_offer     下发升级提议（body=manifest JSON）
 //	GET  /_test/dump              返回收到的所有消息（JSONL）
 //	GET  /_test/files/<name>      暴露 -files-dir 下的文件（自升级下载用）
+//	POST /_test/set_default_config 改「配置版本文件库的默认版本」（body=新正文；用于验证节点自动收敛）
+//
+// REST 兜底面（与真实面板 /api/v1/agent/* 同构；-rest-only 时 /control 返回 501，模拟 Laravel 面板）：
+//
+//	GET  /api/v1/agent/config/default   配置版本文件库的默认版本（current_version/current_sha256 参与判断）
+//	GET  /api/v1/agent/config/latest    本节点发布的版本（这里恒为“没有”）
+//	POST /api/v1/agent/config/ack       配置回执（记录 status/applied）
+//	POST /api/v1/agent/heartbeat        REST 兜底心跳
 package main
 
 import (
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"math/rand"
 	"net/http"
@@ -76,6 +86,106 @@ type server struct {
 	resends     int
 
 	start time.Time
+
+	// restOnly：/api/v1/agent/control 返回 501，强制 Agent 走 REST 兜底（对齐真实 Laravel 面板）
+	restOnly bool
+	// defaultConfig：配置版本文件库的默认版本正文（节点应当自动收敛到它）
+	defaultConfig string
+	defaultSHA    string
+	defaultVer    int
+	acks          []map[string]any
+}
+
+// setDefaultConfig 设置配置版本文件库的默认版本（版本号自增，sha256 由正文算出）。
+func (s *server) setDefaultConfig(content string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.defaultConfig = content
+	s.defaultVer++
+	sum := sha256.Sum256([]byte(content))
+	s.defaultSHA = hex.EncodeToString(sum[:])
+}
+
+func (s *server) defaultConfigSnapshot() (string, string, int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return s.defaultConfig, s.defaultSHA, s.defaultVer
+}
+
+func (s *server) handleSetDefaultConfig(w http.ResponseWriter, r *http.Request) {
+	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+	if err != nil {
+		http.Error(w, err.Error(), 400)
+
+		return
+	}
+	s.setDefaultConfig(string(body))
+	_, sum, ver := s.defaultConfigSnapshot()
+	fmt.Fprintf(w, "version=%d sha256=%s\n", ver, sum)
+}
+
+func (s *server) handleRESTHeartbeat(w http.ResponseWriter, r *http.Request) {
+	s.mu.Lock()
+	s.heartbeats++
+	s.mu.Unlock()
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok": true, "node_id": "mock", "server_time": time.Now().UTC().Format(time.RFC3339),
+		"heartbeat_interval_seconds": s.hbInterval, "telemetry_interval_seconds": s.telInterval,
+		"config": map[string]any{"version": nil, "up_to_date": true},
+	})
+}
+
+// handleRESTConfigLatest：本节点发布的版本 —— mock 里恒为「没有」，
+// 这样节点只能靠 /config/default（版本文件库的默认版本）收敛，正好覆盖用户要的那条路。
+func (s *server) handleRESTConfigLatest(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "up_to_date": true, "config": nil})
+}
+
+func (s *server) handleRESTConfigDefault(w http.ResponseWriter, r *http.Request) {
+	content, sum, ver := s.defaultConfigSnapshot()
+	if content == "" {
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "up_to_date": true, "config": nil,
+			"note": "配置版本文件库里还没有默认版本。"})
+
+		return
+	}
+
+	curVer := atoiSafe(r.URL.Query().Get("current_version"))
+	curSha := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("current_sha256")))
+	if curVer == ver && (curSha == "" || curSha == sum) {
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "up_to_date": true,
+			"config": map[string]any{"version": ver, "sha256": sum}})
+
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "up_to_date": false, "config": map[string]any{
+		"version": ver, "sha256": sum, "revision": fmt.Sprint(ver),
+		"content_yaml": content, "source": "config-file",
+	}})
+}
+
+func (s *server) handleRESTConfigAck(w http.ResponseWriter, r *http.Request) {
+	var body map[string]any
+	_ = json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&body)
+	s.mu.Lock()
+	s.acks = append(s.acks, body)
+	s.mu.Unlock()
+	fmt.Fprintf(os.Stderr, "[mockcontrol] config ack: %v\n", body)
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+func atoiSafe(s string) int {
+	n := 0
+	for _, c := range s {
+		if c < '0' || c > '9' {
+			return n
+		}
+		n = n*10 + int(c-'0')
+	}
+
+	return n
 }
 
 var upgrader = websocket.Upgrader{
@@ -93,13 +203,23 @@ func main() {
 	autoAck := flag.Bool("auto-ack", true, "是否自动累积确认事件")
 	hbInterval := flag.Int("heartbeat-interval", 5, "下发给 Agent 的心跳间隔（秒）")
 	telInterval := flag.Int("telemetry-interval", 2, "下发给 Agent 的遥测间隔（秒）")
+	restOnly := flag.Bool("rest-only", false, "让 /api/v1/agent/control 返回 501，强制 Agent 走 REST 兜底（对齐真实面板）")
+	defaultConfigFile := flag.String("default-config", "", "配置版本文件库的默认版本正文文件（节点会自动收敛到它）")
 	flag.Parse()
 
 	s := &server{
 		nodes: map[string]*nodeState{}, byName: map[string]*nodeState{},
 		enrollToken: *token, dumpPath: *dump, filesDir: *filesDir,
 		autoAck: *autoAck, hbInterval: *hbInterval, telInterval: *telInterval,
-		start: time.Now(),
+		restOnly: *restOnly,
+		start:    time.Now(),
+	}
+	if *defaultConfigFile != "" {
+		b, err := os.ReadFile(*defaultConfigFile)
+		if err != nil {
+			log.Fatalf("读取 default-config 失败: %v", err)
+		}
+		s.setDefaultConfig(string(b))
 	}
 	if err := os.WriteFile(*dump, nil, 0o644); err != nil {
 		log.Fatalf("初始化 dump 文件失败: %v", err)
@@ -113,6 +233,12 @@ func main() {
 	mux.HandleFunc("/_test/push_config", s.handlePushConfig)
 	mux.HandleFunc("/_test/command", s.handleCommand)
 	mux.HandleFunc("/_test/ack_all", s.handleAckAll)
+	mux.HandleFunc("/_test/set_default_config", s.handleSetDefaultConfig)
+	// REST 兜底面（与真实面板同构）
+	mux.HandleFunc("/api/v1/agent/heartbeat", s.handleRESTHeartbeat)
+	mux.HandleFunc("/api/v1/agent/config/latest", s.handleRESTConfigLatest)
+	mux.HandleFunc("/api/v1/agent/config/default", s.handleRESTConfigDefault)
+	mux.HandleFunc("/api/v1/agent/config/ack", s.handleRESTConfigAck)
 	mux.HandleFunc("/_test/upgrade_offer", s.handleUpgradeOffer)
 	mux.HandleFunc("/_test/dump", func(w http.ResponseWriter, r *http.Request) {
 		http.ServeFile(w, r, s.dumpPath)
@@ -220,6 +346,12 @@ func randomSecret() string {
 // ---------------------------- 控制通道 ----------------------------
 
 func (s *server) handleControl(w http.ResponseWriter, r *http.Request) {
+	if s.restOnly {
+		// 真实 Laravel 面板终结不了二进制 WS（返回 501），Agent 据此降级到 REST。
+		http.Error(w, "binary WS not supported", http.StatusNotImplemented)
+
+		return
+	}
 	auth := strings.TrimSpace(strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer "))
 	nodeID := r.Header.Get("X-Node-ID")
 	if auth == "" {
@@ -488,6 +620,10 @@ func (s *server) handleState(w http.ResponseWriter, r *http.Request) {
 		"commands_sent":  s.commands,
 		"nodes":          nodes,
 		"revision":       s.revision,
+		// REST 兜底面：配置版本文件库的默认版本 + 收到的配置回执（验证节点自动收敛用）
+		"default_config_version": s.defaultVer,
+		"default_config_sha256":  s.defaultSHA,
+		"config_acks":            s.acks,
 	})
 }
 

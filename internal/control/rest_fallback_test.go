@@ -55,8 +55,11 @@ func TestRESTFallbackHeartbeatIsIndependentOfConfigApply(t *testing.T) {
 				lastBody.Store(string(raw))
 			}
 			_, _ = io.WriteString(w, `{"ok":true}`)
-		case r.URL.Path == "/api/v1/agent/config/latest":
-			// 一直说有新配置：逼 agent 反复去应用（也就是一直卡在 blockHandler 上）
+		case r.URL.Path == "/api/v1/agent/config/latest",
+			r.URL.Path == "/api/v1/agent/config/default":
+			// 一直说有新配置：逼 agent 反复去应用（也就是一直卡在 blockHandler 上）。
+			// 两个端点都要给：守护进程默认来源是「配置版本文件库的默认版本」(/config/default)，
+			// 只实现 latest 会让轮询根本跑不到（这个用例曾经因此假过）。
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"ok": true, "up_to_date": false,
 				"config": map[string]any{
