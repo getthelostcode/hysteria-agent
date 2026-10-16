@@ -401,6 +401,10 @@ type LatestConfig struct {
 	Revision string
 	SHA256   string
 	Content  string
+	// Source：这一份实际是从哪个来源拿到的（node / default）。
+	Source string
+	// FellBackFromDefault：文件库里还没有默认版本，已退回本节点发布的版本。
+	FellBackFromDefault bool
 }
 
 const defaultRESTConfigPath = "/api/v1/agent/config/latest"
@@ -417,7 +421,38 @@ const defaultRESTDefaultConfigPath = "/api/v1/agent/config/default"
 //
 // 守护进程的兜底轮询与 CLI 的 `hysteria-agent config sync` 共用这一份实现：
 // 鉴权（node_secret 自签 JWT）、TLS/pinning、错误处理都不该有两份，否则迟早分叉。
+// FetchLatestConfig 取配置：source=default 时优先「配置版本文件库的默认版本」，
+// 但**库里还没有默认版本时自动退回本节点发布的版本** —— 否则会出现「面板明明发布了配置，
+// 节点却因为运维还没在版本管理里指定默认版本而一无所获」（install.sh 装完不更新就是这么来的）。
 func FetchLatestConfig(ctx context.Context, cfg *config.Config, cr *creds.Credentials, currentVersion int, currentSHA, source string) (*LatestConfig, error) {
+	out, err := fetchLatestConfig(ctx, cfg, cr, currentVersion, currentSHA, source)
+	if err != nil {
+		return nil, err
+	}
+
+	if source != ConfigSourceDefault {
+		return out, nil
+	}
+
+	if strings.TrimSpace(out.Content) != "" || out.Version > 0 {
+		return out, nil
+	}
+
+	alt, altErr := fetchLatestConfig(ctx, cfg, cr, currentVersion, currentSHA, ConfigSourceNode)
+	if altErr != nil {
+		// 退回也失败：如实把「库里没有默认版本」这件事告诉调用方，别假装有配置
+		out.FellBackFromDefault = true
+
+		return out, nil
+	}
+
+	alt.FellBackFromDefault = true
+
+	return alt, nil
+}
+
+func fetchLatestConfig(ctx context.Context, cfg *config.Config, cr *creds.Credentials, currentVersion int, currentSHA, source string) (*LatestConfig, error) {
+	out := &LatestConfig{Source: ConfigSourceNode}
 	path := cfg.Control.RESTConfigPath
 	if path == "" {
 		path = defaultRESTConfigPath
@@ -429,6 +464,7 @@ func FetchLatestConfig(ctx context.Context, cfg *config.Config, cr *creds.Creden
 		if path == "" {
 			path = defaultRESTDefaultConfigPath
 		}
+		out.Source = ConfigSourceDefault
 	}
 
 	url := fmt.Sprintf("%s?current_version=%d", cfg.ControlHTTPURL(path), currentVersion)
@@ -469,7 +505,7 @@ func FetchLatestConfig(ctx context.Context, cfg *config.Config, cr *creds.Creden
 		return nil, fmt.Errorf("解析控制面响应失败: %w", err)
 	}
 
-	out := &LatestConfig{UpToDate: payload.UpToDate}
+	out.UpToDate = payload.UpToDate
 	if payload.Config != nil {
 		out.Version = payload.Config.Version
 		out.Revision = payload.Config.Revision

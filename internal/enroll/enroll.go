@@ -72,6 +72,26 @@ type Options struct {
 	HysteriaBin string
 }
 
+// machineIDFor 决定上报给控制面的 machine_id：
+//  1. agent 配置 enroll.machine_id（克隆镜像时给每台一个固定值）
+//  2. 环境变量 HYSTERIA_AGENT_MACHINE_ID（回归测试/临时覆盖）
+//  3. 本机 /etc/machine-id
+//
+// 为什么要能覆盖：clone 出来的 VPS 镜像 machine-id 相同，控制面按 machine_id 认节点，
+// 于是两台机器会互相顶掉注册（只有一台能出现在面板里）。
+func machineIDFor(cfg *config.Config) string {
+	if cfg != nil {
+		if v := strings.TrimSpace(cfg.Enroll.MachineID); v != "" {
+			return v
+		}
+	}
+	if v := strings.TrimSpace(os.Getenv("HYSTERIA_AGENT_MACHINE_ID")); v != "" {
+		return v
+	}
+
+	return sysinfo.MachineID()
+}
+
 // Run 执行注册并落盘凭据；返回写入的凭据。token 不会出现在日志里（只打印前 6 位）。
 func Run(ctx context.Context, cfg *config.Config, opt Options, logf func(format string, args ...any)) (*creds.Credentials, error) {
 	if logf == nil {
@@ -110,7 +130,7 @@ func Run(ctx context.Context, cfg *config.Config, opt Options, logf func(format 
 		OS:           "linux",
 		Arch:         sysinfo.Arch(),
 		Kernel:       sysinfo.Kernel(),
-		MachineID:    sysinfo.MachineID(),
+		MachineID:    machineIDFor(cfg),
 		BootID:       sysinfo.BootID(),
 		AgentVersion: version.Version,
 		Protocol:     "v1",

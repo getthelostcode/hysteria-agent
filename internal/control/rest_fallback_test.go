@@ -226,7 +226,11 @@ func TestFetchLatestConfigUsesConfiguredSource(t *testing.T) {
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		lastPath.Store(r.URL.Path)
-		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "up_to_date": true})
+		// 必须真给一份配置：库端点回「空」时会触发「退回 node 来源」的兜底，那就测不出端点选择了
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"ok": true, "up_to_date": false,
+			"config": map[string]any{"version": 3, "sha256": "s3", "revision": "3", "content_yaml": "listen: :443\n"},
+		})
 	}))
 	defer srv.Close()
 
@@ -254,5 +258,74 @@ func TestFetchLatestConfigUsesConfiguredSource(t *testing.T) {
 	}
 	if got, _ := lastPath.Load().(string); got != "/api/v1/agent/config/default" {
 		t.Fatalf("default 来源应打 /config/default，实际 %s", got)
+	}
+}
+
+// 文件库里还没有默认版本 → 自动退回本节点发布的版本（否则「面板发布了配置、节点一无所获」）。
+func TestFetchLatestConfigFallsBackToNodeSourceWhenLibraryIsEmpty(t *testing.T) {
+	var paths []string
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		paths = append(paths, r.URL.Path)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"ok": true, "up_to_date": false,
+			"config": map[string]any{
+				"version": 7, "sha256": "abc", "revision": "7", "content_yaml": "listen: :443\n",
+			},
+		})
+	}))
+	defer srv.Close()
+
+	dir := t.TempDir()
+	cfg := config.Default()
+	cfg.Control.ServerURL = srv.URL
+	cfg.Control.AllowInsecureWS = true
+	cfg.CredentialsFile = filepath.Join(dir, "creds.json")
+	writeCreds(t, cfg.CredentialsFile, "nd_fallback_test")
+
+	cr, err := creds.Load(cfg.CredentialsFile)
+	if err != nil {
+		t.Fatalf("creds: %v", err)
+	}
+
+	// 库为空（config: null）时控制面默认端点会这么回
+	emptySrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		paths = append(paths, r.URL.Path)
+		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "up_to_date": true, "config": nil})
+	}))
+	defer emptySrv.Close()
+
+	cfg.Control.RESTDefaultConfigPath = "/api/v1/agent/config/default"
+	cfg.Control.RESTConfigPath = "/api/v1/agent/config/latest"
+
+	// 1) 库端点空 + node 端点有内容 → 内容来自 node，且标记回退
+	cfg.Control.ServerURL = srv.URL
+	withBoth := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		paths = append(paths, r.URL.Path)
+		if r.URL.Path == "/api/v1/agent/config/default" {
+			_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "up_to_date": true, "config": nil})
+
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"ok": true, "up_to_date": false,
+			"config": map[string]any{"version": 7, "sha256": "abc", "revision": "7", "content_yaml": "listen: :443\n"},
+		})
+	}))
+	defer withBoth.Close()
+	cfg.Control.ServerURL = withBoth.URL
+
+	out, err := FetchLatestConfig(context.Background(), cfg, cr, 0, "", ConfigSourceDefault)
+	if err != nil {
+		t.Fatalf("取配置失败: %v", err)
+	}
+	if !out.FellBackFromDefault || out.Source != ConfigSourceNode {
+		t.Fatalf("应标记「退回 node 来源」，实际 %+v", out)
+	}
+	if out.Version != 7 || strings.TrimSpace(out.Content) == "" {
+		t.Fatalf("退回后应拿到 node 的配置，实际 %+v", out)
+	}
+	if len(paths) < 2 || paths[0] != "/api/v1/agent/config/default" || paths[1] != "/api/v1/agent/config/latest" {
+		t.Fatalf("应先问 default 再问 latest，实际 %v", paths)
 	}
 }

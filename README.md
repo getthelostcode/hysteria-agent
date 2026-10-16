@@ -78,7 +78,11 @@ hysteria-agent config sync --reload      # 落盘后顺带重启被守护的 Hys
   `control.config_source: default`；
 * 命令行可临时覆盖：`hysteria-agent config sync --source node`；
 * 按文件库同步时节点回执的版本号在本节点没有对应行，控制面会**补记一条**（`config.applied_from_library`），
-  所以节点的应用历史仍然完整。
+  所以节点的应用历史仍然完整；
+* **文件库里还没有默认版本时自动退回「本节点发布的版本」**并如实打印来源 —— 否则会出现
+  「面板明明发布了配置、节点一无所获」（install.sh 装完不更新就是这么来的）；
+* install.sh 的第 5 步同步可用 `SYNC_CONFIG_SOURCE=node` 指定按节点版本取；
+* `--dry-run` 输出也会标明来源。
 
 回归：`bash tests/install_sync_e2e.sh`（16 项断言，跑**真的 install.sh**：装完→发布新版本→再跑一次→
 磁盘自动跟上；`--no-sync-config` 跳过；已是最新不重复写）。
@@ -95,7 +99,42 @@ hysteria-agent config sync --reload      # 落盘后顺带重启被守护的 Hys
 
 回归：`bash tests/install_binary_freshness_test.sh`（10 项断言，含「用 go shim 验证确实走了源码重建」）。
 
-### 配置下发也是 REST 兜底（面板「发布配置」靠它生效）
+### 克隆镜像与 machine_id
+
+控制面按 `machine_id` 认节点：**克隆出来的 VPS 镜像 machine-id 相同**，两台会互相顶掉注册
+（面板里只留得下一台）。给每台机器一个固定值即可：
+
+```yaml
+enroll:
+  machine_id: "jp8-ip2-one"      # 或临时：HYSTERIA_AGENT_MACHINE_ID=xxx hysteria-agent enroll …
+```
+
+## 版本标识与「回到某一版」
+
+* 二进制的版本标签 = **最后改动 agent 源码的那个提交**（不是打包提交）：打包/文档提交一行代码没改，
+  却会让源码重建出来的二进制自报另一个 commit —— 同一份代码两个身份，事后对账全是问号。
+  源码有未提交改动时标签带 `-dirty`。
+* 仓库里的发布产物旁边有 `.commit`（构建来源提交）和 `.sha256`；`install.sh` 按 `.commit` 判断
+  「发布产物是不是过期」，不再因为一次 `git pull` 的 mtime 变化就重建。
+* 安装来源优先级：`AGENT_BINARY` > `dist/`（发布产物）> `release/` 包 > `bin/`（本机遗留构建，最后）。
+  真实现场：本机遗留的 `bin/hysteria-agent`（几周前的 `d4482cd`）曾把发布产物顶掉，装出来还是旧的。
+* 重打发布产物：`make dist` 或 `bash scripts/release-dist.sh`（编译 + `.sha256` + `.commit`）。
+
+**回到指定发布版本**（例如 `hysteria-agent 0.1.0 (61145e9, …)`）：
+
+```bash
+cd ~/hysteria-agent && git pull
+git log --oneline -5 -- dist/hysteria-agent-linux-amd64        # 找那一版的打包提交
+git checkout <打包提交> -- dist/hysteria-agent-linux-amd64 \
+    dist/hysteria-agent-linux-amd64.sha256 dist/hysteria-agent-linux-amd64.commit
+sudo -E bash install.sh https://node.ipx.sarl --skip-enroll --no-rebuild   # 原样装这一版
+hysteria-agent version                                          # 应显示 (61145e9, …)
+```
+
+* `--no-rebuild`：只用现成产物、**绝不**源码重建（版本可复现；本机没 Go 工具链时也必须加）。
+* 不加 `--no-rebuild`：`.commit` 与当前源码提交不一致 → 自动源码重建，标签 = 源码提交。
+
+## 配置下发也是 REST 兜底（面板「发布配置」靠它生效）
 
 控制通道 501（Laravel 终结不了二进制 WS）时，agent 不只在 REST 里发心跳，还会**轮询配置**：
 

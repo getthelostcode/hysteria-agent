@@ -17,6 +17,9 @@ PANEL_EMAIL="${PANEL_EMAIL:-admin@example.com}"
 PANEL_PASSWORD="${PANEL_PASSWORD:-password}"
 WORK="${WORK:-/tmp/config-sync-test}"
 export PATH="$PATH:/usr/local/go/bin"
+# 每次跑用**全新** machine_id：否则控制面按 machine_id 认节点，第二次跑会落到上一轮那台节点上
+# （带着 v1..v5 历史），「还没发布配置」之类的断言全错位。
+export HYSTERIA_AGENT_MACHINE_ID="config-sync-e2e-$(date +%s)-$$"
 
 PASS=0; FAIL=0
 ok()  { PASS=$((PASS+1)); printf '[PASS] %s\n' "$*"; }
@@ -111,10 +114,18 @@ cp "$WORK/etc/hysteria/config.yaml" "$WORK/original.yaml"
 NODE_ID="$(python3 -c "import json;print(json.load(open('$WORK/etc/agent/credentials.json'))['node_id'])" 2>/dev/null)"
 [[ -n "${NODE_ID:-}" ]] && ok "注册成功：$NODE_ID" || { bad "注册失败"; tail -5 "$WORK/logs/enroll.log"; exit 1; }
 
+log "1b) 默认来源是「配置版本文件库的默认版本」：要么取到它，要么如实说明并退回本节点版本"
+"$WORK/bin/hysteria-agent" -config "$WORK/etc/agent/config.yaml" config sync --dry-run >"$WORK/logs/sync-default.log" 2>&1
+if grep -qE '来源：配置版本文件库的默认版本|配置版本文件库里还没有默认版本 → 按本节点发布的版本同步|已是最新配置' "$WORK/logs/sync-default.log"; then
+  ok "默认来源行为明确（文件库默认版本 / 退回节点版本 / 已是最新），输出：$(head -1 "$WORK/logs/sync-default.log")"
+else
+  bad "默认来源输出不符：$(cat "$WORK/logs/sync-default.log")"
+fi
+
 log "2) 控制面还没发布配置 → sync 不该动本地文件"
-"$WORK/bin/hysteria-agent" -config "$WORK/etc/agent/config.yaml" config sync >"$WORK/logs/sync0.log" 2>&1
+"$WORK/bin/hysteria-agent" -config "$WORK/etc/agent/config.yaml" config sync --source node >"$WORK/logs/sync0.log" 2>&1
 SYNC0=$?
-grep -q "已是最新\|没有已发布" "$WORK/logs/sync0.log" && ok "如实报告「没有更新的版本」" || { bad "输出不符：$(cat "$WORK/logs/sync0.log")"; }
+grep -qE "已是最新|没有已发布|还没有给本节点发布过配置" "$WORK/logs/sync0.log" && ok "如实报告「没有更新的版本」" || { bad "输出不符：$(cat "$WORK/logs/sync0.log")"; }
 diff -q "$WORK/etc/hysteria/config.yaml" "$WORK/original.yaml" >/dev/null && ok "本地配置未被改动" || bad "本地配置被改了"
 
 log "3) 面板发布 v1 → sync 立刻落盘"
@@ -137,7 +148,7 @@ V1="$(printf '%s\n' "$PUB1" | sed -n 's/^version //p')"
 SHA1="$(printf '%s\n' "$PUB1" | sed -n 's/^sha256 //p')"
 [[ -n "$V1" ]] && ok "发布 v$V1" || { bad "发布失败"; exit 1; }
 
-"$WORK/bin/hysteria-agent" -config "$WORK/etc/agent/config.yaml" config sync >"$WORK/logs/sync1.log" 2>&1
+"$WORK/bin/hysteria-agent" -config "$WORK/etc/agent/config.yaml" config sync --source node >"$WORK/logs/sync1.log" 2>&1
 SYNCR=$?
 [[ "$SYNCR" == "0" ]] && ok "sync 成功退出" || { bad "sync 失败：$(cat "$WORK/logs/sync1.log")"; }
 cat "$WORK/logs/sync1.log" | sed 's/^/    /'
@@ -151,7 +162,7 @@ check "落盘内容与面板发布的 sha256 一致（跑完就是最新那份�
 log "4) 再 sync 一次：已是最新，不该重复写"
 BEFORE="$(stat -c %Y "$WORK/etc/hysteria/config.yaml")"
 sleep 1
-"$WORK/bin/hysteria-agent" -config "$WORK/etc/agent/config.yaml" config sync >"$WORK/logs/sync2.log" 2>&1
+"$WORK/bin/hysteria-agent" -config "$WORK/etc/agent/config.yaml" config sync --source node >"$WORK/logs/sync2.log" 2>&1
 grep -q "已是最新" "$WORK/logs/sync2.log" && ok "识别为已是最新" || bad "没有识别为已是最新：$(cat "$WORK/logs/sync2.log")"
 [[ "$(stat -c %Y "$WORK/etc/hysteria/config.yaml")" == "$BEFORE" ]] && ok "文件没被重复写" || bad "文件被重复写了"
 
@@ -163,7 +174,7 @@ tls:
 # marker: from-panel-bad
 "
 panel publish "$NODE_ID" "$BAD_YAML" "config-sync 坏配置" >/dev/null
-"$WORK/bin/hysteria-agent" -config "$WORK/etc/agent/config.yaml" config sync >"$WORK/logs/sync3.log" 2>&1
+"$WORK/bin/hysteria-agent" -config "$WORK/etc/agent/config.yaml" config sync --source node >"$WORK/logs/sync3.log" 2>&1
 SYNC3=$?
 [[ "$SYNC3" == "0" ]] && ok "面板为准：仍然写入并成功退出" || { bad "sync 非 0 退出：$(cat "$WORK/logs/sync3.log")"; }
 check "明确说了「面板为准」" "grep -q '按「面板为准」仍会写入' '$WORK/logs/sync3.log'"
@@ -179,7 +190,7 @@ tls:
 # marker: from-panel-bad2
 "
 panel publish "$NODE_ID" "$BAD2_YAML" "config-sync 坏配置2" >/dev/null
-"$WORK/bin/hysteria-agent" -config "$WORK/etc/agent/config.yaml" config sync --strict >"$WORK/logs/sync3b.log" 2>&1
+"$WORK/bin/hysteria-agent" -config "$WORK/etc/agent/config.yaml" config sync --source node --strict >"$WORK/logs/sync3b.log" 2>&1
 [[ $? -ne 0 ]] && ok "--strict 下被拒（非 0 退出）" || bad "--strict 竟然写入了"
 check "被拒时文件保持不动" "! grep -q 'marker: from-panel-bad2' '$WORK/etc/hysteria/config.yaml'"
 check "仍是上一次写下的内容" "grep -q 'marker: from-panel-bad' '$WORK/etc/hysteria/config.yaml'"
@@ -195,15 +206,15 @@ auth:
 # marker: from-panel-v4
 "
 panel publish "$NODE_ID" "$V4_YAML" "config-sync v4" >/dev/null
-"$WORK/bin/hysteria-agent" -config "$WORK/etc/agent/config.yaml" config sync --dry-run >"$WORK/logs/sync4.log" 2>&1
+"$WORK/bin/hysteria-agent" -config "$WORK/etc/agent/config.yaml" config sync --source node --dry-run >"$WORK/logs/sync4.log" 2>&1
 check "dry-run 明确说了 --dry-run" "grep -q -- '--dry-run' '$WORK/logs/sync4.log'"
 check "dry-run 没落盘" "! grep -q 'marker: from-panel-v4' '$WORK/etc/hysteria/config.yaml'"
-"$WORK/bin/hysteria-agent" -config "$WORK/etc/agent/config.yaml" config sync >"$WORK/logs/sync5.log" 2>&1
+"$WORK/bin/hysteria-agent" -config "$WORK/etc/agent/config.yaml" config sync --source node >"$WORK/logs/sync5.log" 2>&1
 check "去掉 dry-run 后正常落盘" "grep -q 'marker: from-panel-v4' '$WORK/etc/hysteria/config.yaml'"
 
 log "7) 本机文件被手工改过/曾被拒绝 → 不能误报「已是最新」"
 printf '\n# 手工追加的一行\n' >> "$WORK/etc/hysteria/config.yaml"
-"$WORK/bin/hysteria-agent" -config "$WORK/etc/agent/config.yaml" config sync >"$WORK/logs/sync6.log" 2>&1
+"$WORK/bin/hysteria-agent" -config "$WORK/etc/agent/config.yaml" config sync --source node >"$WORK/logs/sync6.log" 2>&1
 check "说明本机与面板不一致并覆盖" "grep -Eq '与面板 v[0-9]+ 不一致' '$WORK/logs/sync6.log'"
 check "重新落盘（覆盖掉手工改动）" "! grep -q '手工追加的一行' '$WORK/etc/hysteria/config.yaml'"
 check "仍与面板一致" "grep -q 'marker: from-panel-v4' '$WORK/etc/hysteria/config.yaml'"
@@ -212,7 +223,7 @@ log "7b) 面板内容与磁盘一致（重复发布同一份）→ 明确说「�
 M1="$(stat -c %Y "$WORK/etc/hysteria/config.yaml")"
 panel publish "$NODE_ID" "$V4_YAML" "config-sync v4 再发一次" >/dev/null
 sleep 1
-"$WORK/bin/hysteria-agent" -config "$WORK/etc/agent/config.yaml" config sync >"$WORK/logs/sync7.log" 2>&1
+"$WORK/bin/hysteria-agent" -config "$WORK/etc/agent/config.yaml" config sync --source node >"$WORK/logs/sync7.log" 2>&1
 check "按内容判定为已是最新" "grep -q '已是最新配置（与面板' '$WORK/logs/sync7.log'"
 [[ "$(stat -c %Y "$WORK/etc/hysteria/config.yaml")" == "$M1" ]] && ok "内容一致就不写盘" || bad "内容一致却写盘了"
 

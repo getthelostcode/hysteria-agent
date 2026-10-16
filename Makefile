@@ -14,7 +14,9 @@ SHELL      := /bin/bash
 MODULE     := github.com/getthelostcode/hysteria-agent
 BIN        := hysteria-agent
 VERSION    ?= 0.1.0
-COMMIT     := $(shell git rev-parse --short HEAD 2>/dev/null || echo dev)
+# 版本标签取「最后改动 agent 源码的提交」，不是 HEAD：打包/文档提交不改代码，
+# 却会让二进制自报另一个 commit —— 同一份代码两个身份（与 install.sh 的 agent_source_commit 一致）。
+COMMIT     := $(shell git log -1 --format=%h -- cmd internal '*.go' 2>/dev/null || git rev-parse --short HEAD 2>/dev/null || echo dev)$(shell git status --porcelain -- cmd internal '*.go' 2>/dev/null | grep -q . && echo -dirty)
 BUILD_TIME := $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
 GO         ?= /usr/local/go/bin/go
 DIST       := dist
@@ -70,6 +72,7 @@ dist: build
 	mkdir -p $(DIST)
 	cp bin/$(BIN) $(DIST)/$(BIN)-linux-amd64
 	cd $(DIST) && sha256sum $(BIN)-linux-amd64 > $(BIN)-linux-amd64.sha256
+	printf '%s\n' '$(COMMIT)' > $(DIST)/$(BIN)-linux-amd64.commit   # install.sh 靠它判断发布产物过期没有
 	@echo "--- 产物 ---"
 	@ls -l $(DIST)
 

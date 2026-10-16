@@ -42,6 +42,8 @@ set -euo pipefail
 # ---------------------------------------------------------------- 常量与日志
 AGENT_BIN="${AGENT_BIN:-/usr/local/bin/hysteria-agent}"
 AGENT_CFG_DIR="${AGENT_CFG_DIR:-/etc/hysteria-agent}"
+# systemd 单元目录：测试可指向沙箱，避免跑一次回归就往宿主写单元
+UNIT_DIR="${SYSTEMD_UNIT_DIR:-/etc/systemd/system}"
 AGENT_CFG=$AGENT_CFG_DIR/config.yaml
 AGENT_STATE="${AGENT_STATE:-/var/lib/hysteria-agent}"
 AGENT_SERVICE="${AGENT_SERVICE:-hysteria-agent}"
@@ -70,6 +72,7 @@ SKIP_ENROLL=0
 SYNC_CONFIG=1
 SYNC_STRICT=0
 VERIFY_ONLY=0
+NO_REBUILD=0
 UNINSTALL=0
 SET_HYSTERIA_AUTH=0
 HYSTERIA_AUTH_URL_PROVIDED=0
@@ -88,8 +91,10 @@ while [[ $# -gt 0 ]]; do
     --no-hysteria)      NO_HYSTERIA=1 ;;
     --skip-enroll)      SKIP_ENROLL=1 ;;
     --no-sync-config)   SYNC_CONFIG=0 ;;
+#   --no-rebuild         只用仓库里那份发布二进制（版本可复现），不源码重建
     --strict-sync-config) SYNC_STRICT=1 ;;
     --verify-only)      VERIFY_ONLY=1 ;;
+    --no-rebuild|--use-dist) NO_REBUILD=1 ;;   # 只用仓库里那份发布二进制，不源码重建（版本可复现）
     --uninstall)        UNINSTALL=1 ;;
     -h|--help)          sed -n '2,40p' "$0"; exit 0 ;;
     http://*|https://*|ws://*|wss://*) CONTROL_URL="$1" ;;
@@ -107,7 +112,7 @@ if [[ $UNINSTALL -eq 1 ]]; then
   info "卸载 hysteria-agent"
   if [[ $HAS_SYSTEMD -eq 1 ]]; then
     systemctl disable --now "$AGENT_SERVICE" 2>/dev/null || true
-    rm -f "/etc/systemd/system/$AGENT_SERVICE.service" "/lib/systemd/system/$AGENT_SERVICE.service"
+    rm -f "$UNIT_DIR/$AGENT_SERVICE.service" "/lib/systemd/system/$AGENT_SERVICE.service"
     systemctl daemon-reload
   fi
   rm -f "$AGENT_BIN"
@@ -248,9 +253,37 @@ set_hysteria_auth_http() {
 # 仓库里带的是**编译好的**发布产物（dist/hysteria-agent-linux-<arch>）。只改源码 + git pull 的机器
 # 会拿这份旧二进制装上，然后表现成“新功能没生效” —— 真实现场：装到的还是 12:52 那份
 # （那时还没有配置轮询），于是面板发布的配置在库里一直 applied_at 为空。
-agent_binary_stale() { # <binary>：仓库里有比它更新的 .go 源码就算过期
-  local bin="$1"
+# 版本标识：**最后改动 agent 源码的那个提交**，不是 HEAD。
+#
+# 为什么：打包/文档提交（"chore(dist): 重建发布二进制"）一行代码都没改，却会让
+# 「源码重建」出来的二进制自报另一个 commit —— 同一份代码两个身份，事后对账全是问号。
+# 本地有未提交的源码改动时补 -dirty，别谎报成某个干净提交。
+agent_source_commit() {
+  local commit dirty
+  commit="$(cd "$SCRIPT_DIR" && git log -1 --format=%h -- cmd internal '*.go' 2>/dev/null || true)"
+  [[ -n "$commit" ]] || commit="$(cd "$SCRIPT_DIR" && git rev-parse --short HEAD 2>/dev/null || echo dev)"
+  dirty="$(cd "$SCRIPT_DIR" && git status --porcelain -- cmd internal '*.go' 2>/dev/null || true)"
+  [[ -z "$dirty" ]] || commit="${commit}-dirty"
+  printf '%s' "$commit"
+}
+
+# 仓库里那份发布二进制是从哪个提交编的（发布时由 scripts/release-dist.sh 写下）。
+dist_recorded_commit() { # <binary>
+  cat "$1.commit" 2>/dev/null | tr -d '[:space:]' || true
+}
+
+agent_binary_stale() { # <binary>：仓库里的源码比它新就算过期
+  local bin="$1" recorded src
   [[ -f "$bin" ]] || return 1
+
+  # 首选按提交比对：打包提交不改代码，mtime 比法会在每次 git pull 后误判「过期」
+  recorded="$(dist_recorded_commit "$bin")"
+  if [[ -n "$recorded" ]]; then
+    src="$(agent_source_commit)"
+    [[ -n "$src" && "$src" != "$recorded" && "$src" != "${recorded}-dirty" ]]
+    return
+  fi
+
   [[ -n "$(find "$SCRIPT_DIR" -name '*.go' -newer "$bin" -print -quit 2>/dev/null)" ]]
 }
 
@@ -264,7 +297,7 @@ agent_go() { # 找一个可用的 Go 工具链
 build_agent_from_source() { # <out>：用仓库源码构建（带上真实 commit，便于事后对账）
   local out="$1" go commit
   go="$(agent_go)" || return 1
-  commit="$(cd "$SCRIPT_DIR" && git rev-parse --short HEAD 2>/dev/null || echo dev)"
+  commit="$(agent_source_commit)"
   ( cd "$SCRIPT_DIR" && "$go" build -trimpath \
       -ldflags "-s -w \
         -X github.com/getthelostcode/hysteria-agent/internal/version.Version=${AGENT_VERSION:-0.1.0} \
@@ -371,11 +404,14 @@ RAW_BASE="https://raw.githubusercontent.com/${AGENT_REPO_SLUG}/master"
 #   release/hysteria-agent-<ver>-linux-<arch>.tar.gz     完整包（amd64/arm64）
 #   bin/hysteria-agent                                   本机 make build 的产物
 resolve_local_agent() {
+  # 顺序有讲究：**发布产物优先，本地 bin/ 最后**。
+  # bin/ 是本机 make build 的遗留（.gitignore 里），版本可能停在几周前 —— 真实现场：
+  # 沙箱安装时它排在最前面，把 dist/ 的发布产物顶掉，装出来的还是 12:52 那份 d4482cd。
   local cands=(
     "${AGENT_BINARY:-}"
-    "$SCRIPT_DIR/bin/hysteria-agent"
     "$SCRIPT_DIR/dist/hysteria-agent-linux-$ARCH"
     "$SCRIPT_DIR/release/hysteria-agent-$AGENT_VERSION-linux-$ARCH/bin/hysteria-agent"
+    "$SCRIPT_DIR/bin/hysteria-agent"
   )
   local c
   for c in "${cands[@]}"; do
@@ -424,6 +460,13 @@ if [[ -n "${AGENT_BINARY_URL:-}" ]]; then
 elif SRC_BIN="$(resolve_local_agent)"; then
   # 本地二进制可能是仓库里入库的旧构建：装上去会跑旧行为，且从版本号上看不出来。
   if agent_binary_stale "$SRC_BIN"; then
+    if [[ "$NO_REBUILD" == "1" ]]; then
+      info "--no-rebuild：按原样安装 $SRC_BIN（自报 $("$SRC_BIN" version 2>/dev/null | head -1)），不源码重建"
+      if [[ -z "$(dist_recorded_commit "$SRC_BIN")" ]]; then
+        warn "  ↑ 这份不是仓库里的发布产物（没有 .commit 记录），多半是本机遗留构建；要装发布版本用 dist/hysteria-agent-linux-\$ARCH"
+      fi
+      install -m 0755 "$SRC_BIN" "$AGENT_BIN.new"
+    else
     warn "本地二进制 $SRC_BIN 比仓库源码旧（刚 git pull 过？）—— 直接用它会装成旧行为"
     if build_agent_from_source "$AGENT_BIN.new"; then
       info "已改用当前源码重新构建（$( "$AGENT_BIN.new" version 2>/dev/null | head -1)）"
@@ -431,6 +474,7 @@ elif SRC_BIN="$(resolve_local_agent)"; then
     else
       warn "本机没有可用的 Go 工具链，只能沿用这份可能过期的二进制；缺新功能时请在有 Go 的机器上 make build 后重跑"
       install -m 0755 "$SRC_BIN" "$AGENT_BIN.new"
+    fi
     fi
   else
     info "使用本地二进制：$SRC_BIN"
@@ -541,8 +585,8 @@ EOF
   unit_files=""
   [[ $HAS_SYSTEMD -eq 1 ]] && unit_files="$(systemctl list-unit-files 2>/dev/null || true)"
   if [[ $HAS_SYSTEMD -eq 1 ]] && ! grep -q "^$HY_SERVICE.service" <<<"$unit_files"; then
-    info "生成 Hysteria 的 systemd 单元 /etc/systemd/system/$HY_SERVICE.service"
-    write_file "/etc/systemd/system/$HY_SERVICE.service" 644 <<EOF
+    info "生成 Hysteria 的 systemd 单元 $UNIT_DIR/$HY_SERVICE.service"
+    write_file "$UNIT_DIR/$HY_SERVICE.service" 644 <<EOF
 [Unit]
 Description=Hysteria2 Server
 After=network-online.target
@@ -659,9 +703,9 @@ if [[ $HAS_SYSTEMD -eq 1 ]]; then
   UNIT_SRC="$SCRIPT_DIR/deploy/$AGENT_SERVICE.service"
   [[ -f "$UNIT_SRC" ]] || UNIT_SRC="$SCRIPT_DIR/deploy/hysteria-agent.service"
   if [[ -f "$UNIT_SRC" ]]; then
-    install -m 0644 "$UNIT_SRC" "/etc/systemd/system/$AGENT_SERVICE.service"
+    install -m 0644 "$UNIT_SRC" "$UNIT_DIR/$AGENT_SERVICE.service"
   else
-    write_file "/etc/systemd/system/$AGENT_SERVICE.service" 644 <<EOF
+    write_file "$UNIT_DIR/$AGENT_SERVICE.service" 644 <<EOF
 [Unit]
 Description=Hysteria2 Node Agent (hysteria-agent)
 After=network-online.target
@@ -686,7 +730,7 @@ WantedBy=multi-user.target
 EOF
   fi
   systemctl daemon-reload
-  log "已安装 /etc/systemd/system/$AGENT_SERVICE.service"
+  log "已安装 $UNIT_DIR/$AGENT_SERVICE.service"
 fi
 
 if [[ -f "$AGENT_CFG_DIR/credentials.json" && $SKIP_ENROLL -eq 0 ]]; then
@@ -713,9 +757,12 @@ fi
 # 写入前一定会校验：不过就保持现有 $HY_CFG 不动 —— 宁可不同步，也不能把能用的配置换坏。
 # 用 --no-sync-config 可跳过；控制面不可达/还没发布过配置时会明确说明原因，不算安装失败。
 if [[ "$SYNC_CONFIG" == "1" && -f "$AGENT_CFG_DIR/credentials.json" ]]; then
-  info "步骤 5/6：把控制面上的最新配置同步到 $HY_CFG（以面板为准）"
+  info "步骤 5/6：把控制面上的最新配置同步到 $HY_CFG（以面板为准；来源 ${SYNC_CONFIG_SOURCE:-文件库默认版本}）"
   SYNC_ARGS=()
   [[ "$SYNC_STRICT" == "1" ]] && SYNC_ARGS+=(--strict)
+  # 取哪一份配置：默认「配置版本文件库的默认版本」（运维在面板「配置管理 → 版本管理」指定）；
+  # SYNC_CONFIG_SOURCE=node 可按本节点发布的第几版同步。
+  [[ -n "${SYNC_CONFIG_SOURCE:-}" ]] && SYNC_ARGS+=(--source "$SYNC_CONFIG_SOURCE")
   SYNC_LOG="$(mktemp)"
   if "$AGENT_BIN" -config "$AGENT_CFG" config sync "${SYNC_ARGS[@]}" 2>&1 | tee "$SYNC_LOG"; then
     log "配置已同步（历史与回滚：$AGENT_BIN config history -config $AGENT_CFG）"

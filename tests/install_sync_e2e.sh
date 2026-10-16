@@ -106,6 +106,7 @@ run_install() { # run_install <额外参数...>
   AGENT_SERVICE="ha-install-sync-test" \
   HYSTERIA_CONFIG="$WORK/etc/hysteria/config.yaml" \
   HYSTERIA_LISTEN="127.0.0.1:18461" \
+    SYNC_CONFIG_SOURCE="${SYNC_CONFIG_SOURCE:-node}" \
     bash "$ROOT/install.sh" "$PANEL_URL" --no-hysteria "$@" >"$WORK/logs/install-$1.log" 2>&1
 }
 

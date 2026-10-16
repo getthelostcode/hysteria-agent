@@ -31,7 +31,7 @@ extract_fn() {
 LIB="${WORK}/lib.sh"; : > "${LIB}"
 {
   printf 'log()  { :; }\ninfo() { :; }\nwarn() { printf "[WARN] %%s\\n" "$*"; }\ndie()  { printf "[FAIL] %%s\\n" "$*" >&2; exit 1; }\n'
-  for fn in agent_binary_stale agent_go build_agent_from_source; do
+  for fn in agent_source_commit dist_recorded_commit agent_binary_stale agent_go build_agent_from_source; do
     extract_fn "${fn}" >> "${LIB}"; echo >> "${LIB}"
   done
 } 
@@ -50,6 +50,7 @@ cat > "${REPO}/internal/version/version.go" <<'GO'
 package version
 var Version, Commit, BuildTime string
 GO
+# 注意：**不**写 .commit —— 故意验证「没有构建记录时退回 mtime 兜底」这条路
 printf '#!/bin/sh\necho "hysteria-agent 0.1.0 (OLDOLD, 2026-10-15T12:52:37Z)"\n' > "${REPO}/dist/hysteria-agent-linux-amd64"
 chmod +x "${REPO}/dist/hysteria-agent-linux-amd64"
 OLD="${REPO}/dist/hysteria-agent-linux-amd64"

@@ -621,12 +621,16 @@ func syncConfig(cfgPath string, force, strict, dryRun, reload bool, sourceFlag s
 
 	if strings.TrimSpace(rc.Content) == "" {
 		if source == control.ConfigSourceDefault {
-			fmt.Printf("配置版本文件库里还没有默认版本，未改动 %s\n", cfg.Hysteria.ConfigPath)
+			fmt.Printf("配置版本文件库里还没有默认版本、本节点也没有已发布的配置，未改动 %s\n", cfg.Hysteria.ConfigPath)
 		} else {
 			fmt.Printf("控制面还没有给本节点发布过配置，未改动 %s\n", cfg.Hysteria.ConfigPath)
 		}
 
 		return 0
+	}
+
+	if rc.FellBackFromDefault {
+		fmt.Printf("配置版本文件库里还没有默认版本 → 按本节点发布的版本同步\n")
 	}
 
 	payload := []byte(rc.Content)
@@ -684,8 +688,8 @@ func syncConfig(cfgPath string, force, strict, dryRun, reload bool, sourceFlag s
 
 	if dryRun {
 		b, _ := json.MarshalIndent(res, "", "  ")
-		fmt.Printf("--dry-run：控制面 v%d sha256=%s（%d 字节），校验结果：\n%s\n",
-			rc.Version, want, len(payload), string(b))
+		fmt.Printf("--dry-run：控制面 v%d（来源：%s）sha256=%s（%d 字节），校验结果：\n%s\n",
+			rc.Version, sourceLabel(configSourceOf(rc, source)), want, len(payload), string(b))
 
 		return 0
 	}
@@ -717,7 +721,7 @@ func syncConfig(cfgPath string, force, strict, dryRun, reload bool, sourceFlag s
 		fmt.Fprintf(os.Stderr, "清理旧快照失败（不影响本次同步）: %v\n", err)
 	}
 
-	fmt.Printf("已同步控制面 v%d（来源：%s，sha256=%s）→ %s\n", rc.Version, sourceLabel(source), want, path)
+	fmt.Printf("已同步控制面 v%d（来源：%s，sha256=%s）→ %s\n", rc.Version, sourceLabel(configSourceOf(rc, source)), want, path)
 	fmt.Printf("历史快照: rev=%s（回滚：hysteria-agent config rollback -config %s）\n", snap.Revision, cfgPath)
 	if !reload {
 		fmt.Println("提示：让新配置生效 —— systemctl restart hysteria-agent（或加 --reload 让本命令顺带重启 Hysteria）")
@@ -744,6 +748,15 @@ func syncConfig(cfgPath string, force, strict, dryRun, reload bool, sourceFlag s
 	}
 
 	return 0
+}
+
+// configSourceOf：实际拿到配置的来源（控制面回退过就用回退后的来源）。
+func configSourceOf(rc *control.LatestConfig, fallback string) string {
+	if rc != nil && rc.Source != "" {
+		return rc.Source
+	}
+
+	return fallback
 }
 
 // sourceLabel 让输出一眼看出这份配置来自哪儿。

@@ -27,6 +27,13 @@ type Reconnect struct {
 }
 
 // Control 控制面连接参数。
+// Enroll 是注册（enroll）阶段的覆盖项。
+type Enroll struct {
+	// MachineID：覆盖上报给控制面的 machine_id（留空=本机 /etc/machine-id；
+	// 也可用环境变量 HYSTERIA_AGENT_MACHINE_ID 临时覆盖）。
+	MachineID string `yaml:"machine_id"`
+}
+
 type Control struct {
 	ServerURL  string `yaml:"server_url"`
 	WSPath     string `yaml:"ws_path"`
@@ -189,7 +196,10 @@ type TailLogs struct {
 
 // Config 是 agent 的完整配置。
 type Config struct {
-	Control         Control   `yaml:"control"`
+	Control Control `yaml:"control"`
+	// Enroll：注册相关覆盖项。machine_id 用于「克隆出来的 VPS 镜像 machine-id 相同，
+	// 控制面会把两台当同一台节点、注册互相顶掉」，以及回归测试里造全新节点。
+	Enroll          Enroll    `yaml:"enroll"`
 	CredentialsFile string    `yaml:"credentials_file"`
 	StateDir        string    `yaml:"state_dir"`
 	RuntimeDir      string    `yaml:"runtime_dir"`
