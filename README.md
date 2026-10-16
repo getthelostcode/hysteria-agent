@@ -62,6 +62,11 @@ hysteria-agent config sync               # 落盘（0600，原子写，留历史
 hysteria-agent config sync --reload      # 落盘后顺带重启被守护的 Hysteria（mode: systemd）
 ```
 
+**心跳里上报「实盘配置身份」**：每次 REST 心跳带上本机 `/etc/hysteria/config.yaml` 的
+`config_version` / `config_sha256` / `config_path` —— 面板节点列表的「配置版本」以它为准。
+只有文件与某条历史记录**逐字节一致**时才报版本号（`config_source` 取到的是哪一版就是哪一版），
+被手工改过就报版本 0 + 实际 sha256，面板显示「未识别」，不会拿期望版本糊上去。
+
 **取哪一份配置（`--source`）**
 
 | 来源 | 含义 |

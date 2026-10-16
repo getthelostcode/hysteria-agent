@@ -273,6 +273,30 @@ func (s *Store) CurrentRevision() string {
 	return v.Revision
 }
 
+// DiskIdentity 回报**目标配置文件的实际身份**：版本号（revision 里的数字）+ 该记录的 sha256。
+//
+// 只有与某条历史记录逐字节一致时才给版本号（CurrentExact 语义）；被手工改过、或只有本地备份
+// 记录（revision 不是数字）时返回 0 + 文件实际 sha256 —— 调用方据此如实上报「认不出对应版本」，
+// 而不是把控制面的期望版本糊上去。
+func (s *Store) DiskIdentity() (int, string) {
+	sum, err := s.ConfigHash()
+	if err != nil {
+		return 0, ""
+	}
+
+	v, err := s.CurrentExact()
+	if err != nil || v == nil {
+		return 0, sum
+	}
+
+	n, convErr := strconv.Atoi(strings.TrimSpace(v.Revision))
+	if convErr != nil {
+		return 0, sum
+	}
+
+	return n, v.SHA256
+}
+
 // Find 按 revision 或 sha256 前缀查找历史版本。
 func (s *Store) Find(key string) (*Version, error) {
 	vs, err := s.List()

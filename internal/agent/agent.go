@@ -287,6 +287,7 @@ func (a *Agent) stateLoop(ctx context.Context) {
 	write := func() {
 		st := a.sup.State()
 		a.cli.SetState(a.readinessOK(), st.Running, a.Revision(), a.SHA256())
+		a.cli.SetConfigOnDisk(a.diskConfigIdentity())
 		a.m.Snapshot(a.cli.Status().ConnectedSince)
 		if err := a.writeStateFile(); err != nil {
 			a.log.Debug("写状态文件失败", slog.String("error", err.Error()))
@@ -343,6 +344,7 @@ func (a *Agent) HandleHelloAck(ctx context.Context, ack *agentpb.HelloAck) {
 			slog.String("local", have), slog.String("remote", want))
 	}
 	a.cli.SetState(a.readinessOK(), a.sup.IsRunning(), have, a.SHA256())
+	a.cli.SetConfigOnDisk(a.diskConfigIdentity())
 }
 
 // HandleConfigPush 处理配置下发：校验 → 快照 → 原子落盘 → 热更新 → 失败回滚。
@@ -611,6 +613,17 @@ func (a *Agent) SHA256() string {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	return a.currentSHA256
+}
+
+// diskConfigIdentity 回报本机 config.yaml 的**实际**身份，供面板「配置版本」显示。
+// 逻辑在 hyconfig.Store.DiskIdentity（可单测）：认不出对应版本时给 0 + 实际 sha256。
+func (a *Agent) diskConfigIdentity() (int, string) {
+	n, sum := a.store.DiskIdentity()
+	if n == 0 {
+		a.log.Warn("本机配置与控制面已知版本都对不上（可能被手工改过），只上报 sha256", slog.String("sha256", short(sum)))
+	}
+
+	return n, sum
 }
 
 func (a *Agent) setCurrent(revision, sha string) {

@@ -93,12 +93,16 @@ type Client struct {
 	hysteriaVersion string
 	configRevision  string
 	configSHA256    string
-	hysteriaRunning bool
-	ready           bool
-	publicIPAddr    string
-	lastAckAt       time.Time
-	firstResendMark uint64
-	lastDropped     uint64
+	// configDiskVersion/configDiskSHA256：本机 config.yaml 的**实际**身份（面板「配置版本」按它显示）。
+	// 0 = 控制面里没有与该文件逐字节一致的版本（被手工改过等），此时只报 sha。
+	configDiskVersion int
+	configDiskSHA256  string
+	hysteriaRunning   bool
+	ready             bool
+	publicIPAddr      string
+	lastAckAt         time.Time
+	firstResendMark   uint64
+	lastDropped       uint64
 
 	// REST 兜底：控制通道端点不可用（404/405/501，例如 Laravel 面板）时的降级状态
 	restFallback bool
@@ -787,6 +791,15 @@ func (c *Client) RequireAuthRoundTrip(ctx context.Context) error {
 	return nil
 }
 
+// SetConfigOnDisk 记录本机 config.yaml 的实际身份（版本号 + sha256），REST 心跳会带上。
+func (c *Client) SetConfigOnDisk(version int, sha256Hex string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.configDiskVersion = version
+	c.configDiskSHA256 = sha256Hex
+}
+
 // SetPublicIP 记录自报的出口公网地址（REST 心跳会带上；控制面在隧道后只能看到代理地址）。
 func (c *Client) SetPublicIP(ip string) {
 	c.mu.Lock()
@@ -815,6 +828,20 @@ func (c *Client) configSHA256Snapshot() string {
 	defer c.mu.Unlock()
 
 	return c.configSHA256
+}
+
+func (c *Client) configDiskVersionSnapshot() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	return c.configDiskVersion
+}
+
+func (c *Client) configDiskSHA256Snapshot() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	return c.configDiskSHA256
 }
 
 func (c *Client) configRevisionSnapshot() string {

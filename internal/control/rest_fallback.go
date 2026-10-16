@@ -53,6 +53,12 @@ type restHeartbeatBody struct {
 	// 面板写死一个节点上不存在的证书路径、或与 agent 的 hysteria.api_secret 不一致的
 	// trafficStats.secret 时，agent 会**整份拒收**配置（jp8 连发四版全 failed），
 	// 而面板上完全看不出原因。
+	// 本机 /etc/hysteria/config.yaml 的**实际**身份：面板「配置版本」以它为准
+	// （不是面板期望的版本 —— 节点被手工改过时面板要看得出来）。
+	ConfigVersion int    `json:"config_version,omitempty"`
+	ConfigSHA256  string `json:"config_sha256,omitempty"`
+	ConfigPath    string `json:"config_path,omitempty"`
+
 	CertPath           string `json:"cert_path,omitempty"`
 	KeyPath            string `json:"key_path,omitempty"`
 	TrafficStatsListen string `json:"traffic_stats_listen,omitempty"`
@@ -277,6 +283,11 @@ func (c *Client) sendRESTHeartbeat(ctx context.Context) {
 	//     于是发布永远失败（jp8 现场）。
 	//   * listen 取 agent 的 api_base_url：hysteria 绑在哪、agent 读哪里，写回配置后两者一致。
 	//   * 证书路径取配置文件里的（校验就是看这些文件在不在）。
+	// 本机实盘配置的身份（版本号可能为 0 = 认不出对应版本，只报 sha）
+	body.ConfigVersion = c.configDiskVersionSnapshot()
+	body.ConfigSHA256 = c.configDiskSHA256Snapshot()
+	body.ConfigPath = c.cfg.Hysteria.ConfigPath
+
 	shape := readHysteriaShape(c.cfg.Hysteria.ConfigPath)
 	body.CertPath = shape.CertPath
 	body.KeyPath = shape.KeyPath

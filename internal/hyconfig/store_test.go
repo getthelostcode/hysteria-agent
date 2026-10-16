@@ -1,6 +1,8 @@
 package hyconfig
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"os"
 	"path/filepath"
 	"testing"
@@ -180,5 +182,48 @@ func TestStoreRejectedVersionNotUsedForRollback(t *testing.T) {
 	}
 	if prev.Revision != "rev-good" {
 		t.Fatalf("回滚目标应是 rev-good，得到 %s", prev.Revision)
+	}
+}
+
+// DiskIdentity：与控制面版本逐字节一致时报版本号；被手工改过则只报 sha256（版本 0）。
+func TestDiskIdentityReportsOnlyMatchingContent(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.yaml")
+	store := NewStore(filepath.Join(dir, "history"), configPath, 5)
+
+	payload := []byte("listen: :443\n# v7\n")
+	snap, err := store.Snapshot(payload, "7", "yaml", "control-plane", "面板下发")
+	if err != nil {
+		t.Fatalf("snapshot: %v", err)
+	}
+	// 必须 Record：只 Snapshot 不写索引，CurrentExact 找不到记录（真踩过）
+	if err := store.Record(*snap); err != nil {
+		t.Fatalf("record: %v", err)
+	}
+	if err := os.WriteFile(configPath, payload, 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	ver, sum := store.DiskIdentity()
+	if ver != 7 {
+		t.Fatalf("应认出版本 7，实际 %d", ver)
+	}
+	if sum == "" {
+		t.Fatal("sha256 不应为空")
+	}
+
+	// 手工改过 → 认不出对应版本，但 sha256 必须是文件实际内容
+	edited := []byte("listen: :443\n# hand edited\n")
+	if err := os.WriteFile(configPath, edited, 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	ver, sum = store.DiskIdentity()
+	if ver != 0 {
+		t.Fatalf("手工改过应报版本 0，实际 %d", ver)
+	}
+	sum2 := sha256.Sum256(edited)
+	if want := hex.EncodeToString(sum2[:]); sum != want {
+		t.Fatalf("sha256 应为文件实际内容 %s，实际 %s", want, sum)
 	}
 }
