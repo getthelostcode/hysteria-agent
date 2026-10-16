@@ -394,14 +394,30 @@ type LatestConfig struct {
 
 const defaultRESTConfigPath = "/api/v1/agent/config/latest"
 
+// 配置来源：node = 本节点发布的第几版；default = 配置版本文件库的默认版本。
+const (
+	ConfigSourceNode    = "node"
+	ConfigSourceDefault = "default"
+)
+
+const defaultRESTDefaultConfigPath = "/api/v1/agent/config/default"
+
 // FetchLatestConfig 从控制面拉最新配置。
 //
 // 守护进程的兜底轮询与 CLI 的 `hysteria-agent config sync` 共用这一份实现：
 // 鉴权（node_secret 自签 JWT）、TLS/pinning、错误处理都不该有两份，否则迟早分叉。
-func FetchLatestConfig(ctx context.Context, cfg *config.Config, cr *creds.Credentials, currentVersion int, currentSHA string) (*LatestConfig, error) {
+func FetchLatestConfig(ctx context.Context, cfg *config.Config, cr *creds.Credentials, currentVersion int, currentSHA, source string) (*LatestConfig, error) {
 	path := cfg.Control.RESTConfigPath
 	if path == "" {
 		path = defaultRESTConfigPath
+	}
+
+	// source=default：取「配置版本文件库」里运维指定的默认版本（与节点无关的那份文件）。
+	if source == ConfigSourceDefault {
+		path = cfg.Control.RESTDefaultConfigPath
+		if path == "" {
+			path = defaultRESTDefaultConfigPath
+		}
 	}
 
 	url := fmt.Sprintf("%s?current_version=%d", cfg.ControlHTTPURL(path), currentVersion)
@@ -466,7 +482,8 @@ func (c *Client) pollRESTConfig(ctx context.Context) {
 	current := c.restConfigVersion
 	c.mu.Unlock()
 
-	rc, err := FetchLatestConfig(ctx, c.cfg, c.cr, current, c.configSHA256Snapshot())
+	// 守护进程：默认按本节点发布的版本（留空即 node），要看文件库就设 control.config_source: default
+	rc, err := FetchLatestConfig(ctx, c.cfg, c.cr, current, c.configSHA256Snapshot(), c.cfg.Control.ConfigSource)
 	if err != nil {
 		c.m.RESTConfigFailures.Inc()
 		c.log.Warn("REST 拉取配置失败", "error", err.Error())

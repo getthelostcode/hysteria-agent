@@ -16,6 +16,11 @@ control:
   rest_heartbeat_path: "/api/v1/agent/heartbeat"
   # REST 兜底时拉配置的端点；没有它面板「发布配置」到不了节点
   rest_config_path: "/api/v1/agent/config/latest"
+  # 配置版本文件库默认版本的端点（config_source: default 时用）
+  rest_default_config_path: "/api/v1/agent/config/default"
+  # 取哪一份配置：node=本节点发布的第几版（守护进程默认）；default=文件库的默认版本
+  # （`hysteria-agent config sync` 默认走 default）
+  config_source: ""
   # 兜底时的配置轮询间隔（秒）
   config_poll_seconds: 5
   rest_fallback_seconds: 300              # [默认 300] 0 = 关闭兜底

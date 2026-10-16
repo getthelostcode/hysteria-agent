@@ -62,6 +62,19 @@ hysteria-agent config sync               # 落盘（0600，原子写，留历史
 hysteria-agent config sync --reload      # 落盘后顺带重启被守护的 Hysteria（mode: systemd）
 ```
 
+**取哪一份配置（`--source`）**
+
+| 来源 | 含义 |
+| --- | --- |
+| `default`（`config sync` 的默认） | 「配置管理 → 版本管理」里那份**默认版本文件**（`config_files.is_default`），与节点无关 |
+| `node` | **本节点**发布的第几版（`node_configs.is_current`） |
+
+* 守护进程的兜底轮询默认按 `node`（保持原行为）；想让它也跟文件库走，在 agent 配置里写
+  `control.config_source: default`；
+* 命令行可临时覆盖：`hysteria-agent config sync --source node`；
+* 按文件库同步时节点回执的版本号在本节点没有对应行，控制面会**补记一条**（`config.applied_from_library`），
+  所以节点的应用历史仍然完整。
+
 回归：`bash tests/install_sync_e2e.sh`（16 项断言，跑**真的 install.sh**：装完→发布新版本→再跑一次→
 磁盘自动跟上；`--no-sync-config` 跳过；已是最新不重复写）。
 

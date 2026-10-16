@@ -572,7 +572,7 @@ func storeVersion(ctx context.Context, bin string) string {
 //     （agent 侧会硬校验 trafficStats.secret 与证书路径，宁可不同步也不能把能用的配置换坏）。
 //
 // install.sh 的第 5 步与运维手工都用它；`--dry-run` 只看不写，`--reload` 顺带重启被守护的 Hysteria。
-func syncConfig(cfgPath string, force, strict, dryRun, reload bool) int {
+func syncConfig(cfgPath string, force, strict, dryRun, reload bool, sourceFlag string) int {
 	cfg, err := loadOrInitConfig(cfgPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "加载配置失败: %v\n", err)
@@ -599,10 +599,20 @@ func syncConfig(cfgPath string, force, strict, dryRun, reload bool) int {
 	}
 	localSum := sha256Hex(local)
 
+	// 取哪一份：默认「配置版本文件库的默认版本」（运维在「配置管理 → 版本管理」里指定的那份文件）；
+	// 想按「本节点发布的第几版」同步就 --source node，或在 agent 配置里写 control.config_source。
+	source := strings.TrimSpace(sourceFlag)
+	if source == "" {
+		source = strings.TrimSpace(cfg.Control.ConfigSource)
+	}
+	if source == "" {
+		source = control.ConfigSourceDefault
+	}
+
 	// current_version=0 表示「不管本机是第几版」：控制面应当把最新正文给我们，
 	// 由下面的 sha256 比对决定要不要写 —— 版本号只是面板的记账，不能代替内容比对。
 	// 同时把本机内容的 sha 带过去：控制面就地改过版本正文时版本号不变，靠它才认得出来。
-	rc, err := control.FetchLatestConfig(ctx, cfg, cr, 0, localSum)
+	rc, err := control.FetchLatestConfig(ctx, cfg, cr, 0, localSum, source)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "从控制面拉取配置失败: %v\n", err)
 
@@ -610,7 +620,11 @@ func syncConfig(cfgPath string, force, strict, dryRun, reload bool) int {
 	}
 
 	if strings.TrimSpace(rc.Content) == "" {
-		fmt.Printf("控制面还没有已发布的配置，未改动 %s\n", cfg.Hysteria.ConfigPath)
+		if source == control.ConfigSourceDefault {
+			fmt.Printf("配置版本文件库里还没有默认版本，未改动 %s\n", cfg.Hysteria.ConfigPath)
+		} else {
+			fmt.Printf("控制面还没有给本节点发布过配置，未改动 %s\n", cfg.Hysteria.ConfigPath)
+		}
 
 		return 0
 	}
@@ -703,7 +717,7 @@ func syncConfig(cfgPath string, force, strict, dryRun, reload bool) int {
 		fmt.Fprintf(os.Stderr, "清理旧快照失败（不影响本次同步）: %v\n", err)
 	}
 
-	fmt.Printf("已同步控制面 v%d（sha256=%s）→ %s\n", rc.Version, want, path)
+	fmt.Printf("已同步控制面 v%d（来源：%s，sha256=%s）→ %s\n", rc.Version, sourceLabel(source), want, path)
 	fmt.Printf("历史快照: rev=%s（回滚：hysteria-agent config rollback -config %s）\n", snap.Revision, cfgPath)
 	if !reload {
 		fmt.Println("提示：让新配置生效 —— systemctl restart hysteria-agent（或加 --reload 让本命令顺带重启 Hysteria）")
@@ -730,6 +744,15 @@ func syncConfig(cfgPath string, force, strict, dryRun, reload bool) int {
 	}
 
 	return 0
+}
+
+// sourceLabel 让输出一眼看出这份配置来自哪儿。
+func sourceLabel(source string) string {
+	if source == control.ConfigSourceDefault {
+		return "配置版本文件库的默认版本"
+	}
+
+	return "本节点发布的版本"
 }
 
 // sha256Hex 计算 sha256（空内容给空串，便于判断「文件不存在」）。
@@ -791,9 +814,10 @@ func cmdConfig(argv []string) int {
 		strict := fs.Bool("strict", false, "校验不通过就不写（默认「面板为准」：仍写入，问题作为警告打印）")
 		dryRun := fs.Bool("dry-run", false, "只拉取并打印，不落盘")
 		reload := fs.Bool("reload", false, "写完后重启被守护的 Hysteria 服务")
+		source := fs.String("source", "", "取哪一份配置：default=配置版本文件库的默认版本（默认）；node=本节点发布的第几版")
 		_ = fs.Parse(argv[1:])
 
-		return syncConfig(*cfgPath, *force, *strict, *dryRun, *reload)
+		return syncConfig(*cfgPath, *force, *strict, *dryRun, *reload, *source)
 
 	case "validate":
 		fs := flag.NewFlagSet("config validate", flag.ExitOnError)

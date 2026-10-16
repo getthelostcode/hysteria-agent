@@ -219,3 +219,40 @@ func TestRESTFallbackExitsAfterWindow(t *testing.T) {
 	}
 	_ = os.Remove(filepath.Join(dir, "creds.json"))
 }
+
+// 取配置的端点必须按 config_source 走：default=文件库默认版本；留空/node=本节点发布的版本。
+func TestFetchLatestConfigUsesConfiguredSource(t *testing.T) {
+	var lastPath atomic.Value
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		lastPath.Store(r.URL.Path)
+		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "up_to_date": true})
+	}))
+	defer srv.Close()
+
+	dir := t.TempDir()
+	cfg := config.Default()
+	cfg.Control.ServerURL = srv.URL
+	cfg.Control.AllowInsecureWS = true
+	cfg.CredentialsFile = filepath.Join(dir, "creds.json")
+
+	writeCreds(t, cfg.CredentialsFile, "nd_source_test")
+	cr, err := creds.Load(cfg.CredentialsFile)
+	if err != nil {
+		t.Fatalf("creds: %v", err)
+	}
+
+	if _, err := FetchLatestConfig(context.Background(), cfg, cr, 0, "", ""); err != nil {
+		t.Fatalf("node 来源失败: %v", err)
+	}
+	if got, _ := lastPath.Load().(string); got != "/api/v1/agent/config/latest" {
+		t.Fatalf("node 来源应打 /config/latest，实际 %s", got)
+	}
+
+	if _, err := FetchLatestConfig(context.Background(), cfg, cr, 0, "", ConfigSourceDefault); err != nil {
+		t.Fatalf("default 来源失败: %v", err)
+	}
+	if got, _ := lastPath.Load().(string); got != "/api/v1/agent/config/default" {
+		t.Fatalf("default 来源应打 /config/default，实际 %s", got)
+	}
+}

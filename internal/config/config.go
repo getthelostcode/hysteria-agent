@@ -38,7 +38,12 @@ type Control struct {
 	RESTHeartbeatPath string `yaml:"rest_heartbeat_path"`
 	// RESTConfigPath：REST 兜底时拉取配置的端点。没有它，控制面「发布配置」写进库就再无下文
 	// —— 本控制面终结不了二进制 WS，节点只能靠 REST 取配置。
-	RESTConfigPath     string   `yaml:"rest_config_path"`
+	RESTConfigPath string `yaml:"rest_config_path"`
+	// RESTDefaultConfigPath：取「配置版本文件库默认版本」的端点（config_source: default 时用）。
+	RESTDefaultConfigPath string `yaml:"rest_default_config_path"`
+	// ConfigSource：取哪一份配置 —— "node"（本节点发布的第几版）或 "default"（版本文件库的默认版本）。
+	// 留空表示不指定：守护进程按 node，CLI 的 config sync 按 default。
+	ConfigSource       string   `yaml:"config_source"`
 	UserAgent          string   `yaml:"user_agent"`
 	CAFile             string   `yaml:"ca_file"`
 	PinSHA256          []string `yaml:"pin_sha256"` // 证书 SPKI pin（base64）；空则不做 pinning
@@ -222,6 +227,7 @@ func Default() *Config {
 			TokenPath:                 "/api/v1/agent/token",
 			RESTHeartbeatPath:         "/api/v1/agent/heartbeat",
 			RESTConfigPath:            "/api/v1/agent/config/latest",
+			RESTDefaultConfigPath:     "/api/v1/agent/config/default",
 			UserAgent:                 "hysteria-agent",
 			ConnectTimeoutSeconds:     15,
 			HandshakeTimeoutSeconds:   20,
